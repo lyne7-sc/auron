@@ -58,7 +58,7 @@ jobs:
 
       - name: Build dependencies (skip tests)
         run: >
-          ./build/mvn -B install
+          ./build/mvn -B -T1C install
           -pl ${{ matrix.module }}
           -am
           -Pscala-${{ matrix.scalaver }}
@@ -69,7 +69,7 @@ jobs:
 
       - name: Test Paimon Module
         run: >
-          ./build/mvn -B test
+          ./build/mvn -B -T1C test
           -pl ${{ matrix.module }}
           -Pscala-${{ matrix.scalaver }}
           -Ppaimon-${{ matrix.paimon }}
