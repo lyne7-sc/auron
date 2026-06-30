@@ -134,7 +134,7 @@ jobs:
             UNIFFLE_NUMBER="${UNIFFLE_NUMBER#uniffle-}"
           fi
           
-          CMD="./auron-build.sh --pre --sparkver $SPARK_NUMBER --scalaver ${{ inputs.scalaver }} --skiptests false"
+          CMD="./auron-build.sh --pre --sparkver $SPARK_NUMBER --scalaver ${{ inputs.scalaver }} --skiptests false --threads 1C"
           if [ -n "${{ inputs.celebornver }}" ]; then
             CMD="$CMD --celeborn $CELEBORN_NUMBER"
           fi
@@ -175,7 +175,7 @@ jobs:
       - name: Build auron-it (Spark ${{ inputs.sparkver }}, Scala ${{ inputs.scalaver }}, JDK ${{ inputs.javaver }})
         run: |
           cd dev/auron-it
-          ${{ github.workspace }}/build/mvn package -P${{ inputs.sparkver }} -Pscala-${{ inputs.scalaver }}
+          ${{ github.workspace }}/build/mvn -T1C package -P${{ inputs.sparkver }} -Pscala-${{ inputs.scalaver }}
       - name: Upload auron it (Spark ${{ inputs.sparkver }}, Scala ${{ inputs.scalaver }}, JDK ${{ inputs.javaver }})
         uses: actions/upload-artifact@v7
         with:
