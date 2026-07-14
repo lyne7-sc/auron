@@ -28,7 +28,7 @@ import org.apache.spark.sql.catalyst.expressions.{And => SparkAnd, AttributeRefe
 import org.apache.spark.sql.catalyst.plans.physical.KeyGroupedPartitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.connector.read.{InputPartition, Scan}
-import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
+import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceRDDPartition}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BinaryType, DataType, DecimalType, StringType, StructField, StructType}
 
@@ -120,30 +120,15 @@ object IcebergScanSupport extends Logging {
     }
     val (fileSchema, partitionSchema) = schemas.get
 
-    val fieldIdsByName =
-      try {
-        AuronIcebergSourceUtil.expectedFieldIds(scan.asInstanceOf[AnyRef])
-      } catch {
-        case NonFatal(t) =>
-          logWarning(s"Failed to inspect Iceberg field ids for $scanClassName.", t)
-          return None
+    val (fieldIdsByName, renameOrDrop) =
+      inspectFieldIdSupport(
+        fileSchema,
+        scan.asInstanceOf[AnyRef],
+        AuronIcebergSourceUtil.expectedFieldIds,
+        AuronIcebergSourceUtil.detectRenameOrDrop) match {
+        case Some(fieldIdSupport) => fieldIdSupport
+        case None => return None
       }
-
-    val renameOrDrop =
-      try {
-        AuronIcebergSourceUtil.detectRenameOrDrop(scan.asInstanceOf[AnyRef])
-      } catch {
-        case NonFatal(t) =>
-          logWarning(s"Failed to inspect Iceberg schema history for $scanClassName.", t)
-          return None
-      }
-    assert(!renameOrDrop.nested, "Nested Iceberg rename or drop is not supported.")
-
-    val missingFieldIds =
-      fileSchema.fields.filterNot(field => fieldIdsByName.contains(field.name)).map(_.name)
-    assert(
-      missingFieldIds.isEmpty,
-      s"Missing Iceberg field ids for columns: ${missingFieldIds.mkString(", ")}")
 
     val keyGroupedPartitioning = exec.outputPartitioning match {
       case partitioning: KeyGroupedPartitioning => Some(partitioning)
@@ -186,7 +171,8 @@ object IcebergScanSupport extends Logging {
     // ORC cannot match Iceberg columns by field-id yet, so any historical top-level
     // rename/drop may make older ORC files unsafe for native name/position matching.
     val supportedFormat =
-      format == FileFormat.PARQUET || (format == FileFormat.ORC && !renameOrDrop.topLevel)
+      format == FileFormat.PARQUET ||
+        (format == FileFormat.ORC && !renameOrDrop.topLevel)
     if (!supportedFormat) {
       return None
     }
@@ -223,6 +209,16 @@ object IcebergScanSupport extends Logging {
     }
     val (fileSchema, partitionSchema) = schemas.get
 
+    val (fieldIdsByName, renameOrDrop) =
+      inspectFieldIdSupport(
+        fileSchema,
+        scan.asInstanceOf[AnyRef],
+        AuronIcebergSourceUtil.expectedFieldIdsForChangelogScan,
+        AuronIcebergSourceUtil.detectRenameOrDropForChangelogScan) match {
+        case Some(fieldIdSupport) => fieldIdSupport
+        case None => return None
+      }
+
     val partitions = inputPartitions(exec)
     if (partitions.isEmpty) {
       return Some(
@@ -233,7 +229,7 @@ object IcebergScanSupport extends Logging {
           fileSchema,
           partitionSchema,
           Seq.empty,
-          Map.empty))
+          fieldIdsByName))
     }
 
     val icebergPartitions = partitions.flatMap(icebergPartition)
@@ -268,7 +264,12 @@ object IcebergScanSupport extends Logging {
     }
 
     val format = formats.headOption.getOrElse(FileFormat.PARQUET)
-    if (format != FileFormat.PARQUET && format != FileFormat.ORC) {
+    // ORC cannot match Iceberg columns by field-id yet, so any historical top-level
+    // rename/drop may make older ORC files unsafe for native name/position matching.
+    val supportedFormat =
+      format == FileFormat.PARQUET ||
+        (format == FileFormat.ORC && !renameOrDrop.topLevel)
+    if (!supportedFormat) {
       return None
     }
 
@@ -282,7 +283,42 @@ object IcebergScanSupport extends Logging {
         fileSchema,
         partitionSchema,
         pruningPredicates,
-        Map.empty))
+        fieldIdsByName))
+  }
+
+  private def inspectFieldIdSupport(
+      fileSchema: StructType,
+      scan: AnyRef,
+      expectedFieldIds: AnyRef => Map[String, Int],
+      detectRenameOrDrop: AnyRef => AuronIcebergSourceUtil.RenameOrDrop)
+      : Option[(Map[String, Int], AuronIcebergSourceUtil.RenameOrDrop)] = {
+    val scanClassName = scan.getClass.getName
+    val fieldIdsByName =
+      try {
+        expectedFieldIds(scan)
+      } catch {
+        case NonFatal(t) =>
+          logWarning(s"Failed to inspect Iceberg field ids for $scanClassName.", t)
+          return None
+      }
+
+    val renameOrDrop =
+      try {
+        detectRenameOrDrop(scan)
+      } catch {
+        case NonFatal(t) =>
+          logWarning(s"Failed to inspect Iceberg schema history for $scanClassName.", t)
+          return None
+      }
+    assert(!renameOrDrop.nested, "Nested Iceberg rename or drop is not supported.")
+
+    val missingFieldIds =
+      fileSchema.fields.filterNot(field => fieldIdsByName.contains(field.name)).map(_.name)
+    assert(
+      missingFieldIds.isEmpty,
+      s"Missing Iceberg field ids for columns: ${missingFieldIds.mkString(", ")}")
+
+    Some((fieldIdsByName, renameOrDrop))
   }
 
   private def supportedSchemas(
@@ -341,6 +377,24 @@ object IcebergScanSupport extends Logging {
   private def fileScanInputPartitionGroups(
       exec: BatchScanExec,
       isKeyGrouped: Boolean): Option[Seq[Seq[InputPartition]]] = {
+    if (isKeyGrouped) {
+      try {
+        val groups = exec.inputRDD.partitions.map {
+          case partition: DataSourceRDDPartition => partition.inputPartitions.toSeq
+          case partition =>
+            logWarning(
+              s"Unexpected final partition ${partition.getClass.getName} from " +
+                s"${exec.getClass.getName}.")
+            return None
+        }
+        return Some(groups.toSeq)
+      } catch {
+        case NonFatal(t) =>
+          logWarning(s"Failed to obtain final partition groups from ${exec.getClass.getName}.", t)
+          return None
+      }
+    }
+
     try {
       val groups = exec.partitions
       if (groups != null) {
@@ -349,11 +403,6 @@ object IcebergScanSupport extends Logging {
     } catch {
       case NonFatal(t) =>
         logWarning(s"Failed to obtain partition groups from ${exec.getClass.getName}.", t)
-    }
-
-    // Replanning cannot reconstruct key-group boundaries, repetitions, or empty groups.
-    if (isKeyGrouped) {
-      return None
     }
 
     try {

@@ -231,6 +231,56 @@ class AuronIcebergIntegrationSuite
     }
   }
 
+  test("native iceberg scan preserves padded key grouped partitioning") {
+    withTable("local.db.t_padded_join_left", "local.db.t_padded_join_right") {
+      sql("""
+            |create table local.db.t_padded_join_left (id int, p int)
+            |using iceberg
+            |partitioned by (p)
+            |""".stripMargin)
+      sql("insert into local.db.t_padded_join_left values (0, 0), (2, 2)")
+
+      sql("""
+            |create table local.db.t_padded_join_right (value int, p int)
+            |using iceberg
+            |partitioned by (p)
+            |""".stripMargin)
+      sql("insert into local.db.t_padded_join_right values (11, 1), (12, 2)")
+
+      withSQLConf(
+        "spark.sql.adaptive.enabled" -> "false",
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+        "spark.sql.sources.v2.bucketing.enabled" -> "true",
+        "spark.sql.sources.v2.bucketing.pushPartValues.enabled" -> "true",
+        "spark.sql.iceberg.planning.preserve-data-grouping" -> "true") {
+        val df = sql("""
+                       |select l.id, l.p, r.value
+                       |from local.db.t_padded_join_left l
+                       |join local.db.t_padded_join_right r on l.p = r.p
+                       |""".stripMargin)
+
+        val sourceScans = df.queryExecution.sparkPlan.collect { case scan: BatchScanExec => scan }
+        assert(sourceScans.size === 2)
+        assert(sourceScans.forall(_.outputPartitioning.isInstanceOf[KeyGroupedPartitioning]))
+
+        val nativeScans = df.queryExecution.executedPlan.collect {
+          case scan: NativeIcebergTableScanExec => scan
+        }
+        assert(nativeScans.size === 2)
+        nativeScans.foreach { scan =>
+          assert(scan.outputPartitioning.isInstanceOf[KeyGroupedPartitioning])
+          assert(
+            scan.outputPartitioning.numPartitions === scan.doExecuteNative().getNumPartitions)
+        }
+        assert(df.queryExecution.executedPlan.collect { case e: ShuffleExchangeLike =>
+          e
+        }.isEmpty)
+
+        checkAnswer(df, Seq(Row(2, 2, 12)))
+      }
+    }
+  }
+
   test("iceberg native scan is applied for ORC COW table") {
     withTable("local.db.t_orc") {
       sql("""
@@ -527,6 +577,65 @@ class AuronIcebergIntegrationSuite
         assert(
           nativeScanPlan.get.partitionSchema.fieldNames
             .contains(MetadataColumns.CHANGE_TYPE.name()))
+      }
+    }
+  }
+
+  test("iceberg changelog scan reads renamed columns by field id") {
+    withTable("local.db.t_changelog_rename") {
+      withTempView("t_changelog_rename_changes") {
+        sql("""
+              |create table local.db.t_changelog_rename (id int, old_name string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_rename values (0, 'initial')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_rename")
+        sql("insert into local.db.t_changelog_rename values (1, 'before')")
+        sql("alter table local.db.t_changelog_rename rename column old_name to new_name")
+        sql("insert into local.db.t_changelog_rename values (2, 'after')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_rename")
+        createChangelogView(
+          "local.db.t_changelog_rename",
+          "t_changelog_rename_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        checkSparkAnswerAndOperator("""
+            |select id, new_name, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_rename_changes
+            |order by id
+            |""".stripMargin)
+      }
+    }
+  }
+
+  test("iceberg changelog scan does not reuse dropped field id for an added column") {
+    withTable("local.db.t_changelog_drop_add") {
+      withTempView("t_changelog_drop_add_changes") {
+        sql("""
+              |create table local.db.t_changelog_drop_add (id int, value string)
+              |using iceberg
+              |tblproperties ('format-version' = '2')
+              |""".stripMargin)
+        sql("insert into local.db.t_changelog_drop_add values (0, 'initial')")
+        val startSnapshotId = currentSnapshotId("local.db.t_changelog_drop_add")
+        sql("insert into local.db.t_changelog_drop_add values (1, 'old')")
+        sql("alter table local.db.t_changelog_drop_add drop column value")
+        sql("alter table local.db.t_changelog_drop_add add column value string")
+        sql("insert into local.db.t_changelog_drop_add values (2, 'new')")
+        val endSnapshotId = currentSnapshotId("local.db.t_changelog_drop_add")
+        createChangelogView(
+          "local.db.t_changelog_drop_add",
+          "t_changelog_drop_add_changes",
+          startSnapshotId,
+          endSnapshotId)
+
+        checkSparkAnswerAndOperator("""
+            |select id, value, _change_type, _change_ordinal, _commit_snapshot_id
+            |from t_changelog_drop_add_changes
+            |order by id
+            |""".stripMargin)
       }
     }
   }
