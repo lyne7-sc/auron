@@ -19,7 +19,13 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use arrow::{record_batch::RecordBatch, row::Rows};
+use arrow::{
+    array::{Array, ArrayData, ArrayRef, NullBufferBuilder, make_array},
+    buffer::MutableBuffer,
+    datatypes::DataType,
+    record_batch::RecordBatch,
+    row::Rows,
+};
 use async_trait::async_trait;
 use auron_memmgr::{
     MemConsumer, MemConsumerInfo, MemManager,
@@ -173,16 +179,30 @@ impl AggTable {
             };
             let mut acc_table = hashing_data.acc_table;
             let mut keys = hashing_data.map.into_keys();
+            let primitive_grouping = hashing_data.primitive_grouping;
 
             // output in reversed order, so we can truncate records and free
             // memory as soon as possible
             for begin in (0..num_records).step_by(output_batch_size).rev() {
                 let end = std::cmp::min(begin + output_batch_size, num_records);
-                let batch = self.agg_ctx.convert_records_to_batch(
-                    &keys[begin..end],
-                    &mut acc_table,
-                    IdxSelection::Range(begin, end),
-                )?;
+                let batch = match &primitive_grouping {
+                    Some(grouping) => RecordBatch::try_new(
+                        self.agg_ctx.output_schema.clone(),
+                        [
+                            vec![grouping.to_array(&keys[begin..end])?],
+                            self.agg_ctx.build_agg_columns(
+                                &mut acc_table,
+                                IdxSelection::Range(begin, end),
+                            )?,
+                        ]
+                        .concat(),
+                    )?,
+                    None => self.agg_ctx.convert_records_to_batch(
+                        &keys[begin..end],
+                        &mut acc_table,
+                        IdxSelection::Range(begin, end),
+                    )?,
+                };
 
                 // truncate and free memory
                 keys.truncate(begin);
@@ -475,6 +495,7 @@ pub struct HashingData {
     agg_ctx: Arc<AggContext>,
     acc_table: AccTable,
     map: AggHashMap,
+    primitive_grouping: Option<PrimitiveGrouping>,
     num_input_records: usize,
     hashing_time: Time,
 }
@@ -492,6 +513,9 @@ impl HashingData {
         Ok(Self {
             acc_table,
             map: AggHashMap::default(),
+            primitive_grouping: (agg_ctx.groupings.len() == 1)
+                .then(|| agg_ctx.output_schema.field(0).data_type())
+                .and_then(|data_type| PrimitiveGrouping::try_new(data_type, 1)),
             num_input_records: 0,
             agg_ctx,
             hashing_time,
@@ -523,13 +547,21 @@ impl HashingData {
         let num_rows = batch.num_rows();
         self.num_input_records += num_rows;
 
-        let grouping_rows = self.agg_ctx.create_grouping_rows(&batch)?;
-        let record_indices = self.map.upsert_records(
-            grouping_rows
-                .iter()
-                .map(|row| row.as_ref().as_raw_bytes())
-                .collect(),
-        );
+        let record_indices = if let Some(grouping) = &self.primitive_grouping {
+            let grouping_array = self.agg_ctx.groupings[0]
+                .expr
+                .evaluate(&batch)?
+                .into_array(num_rows)?;
+            grouping.upsert_array(&grouping_array, &mut self.map)?
+        } else {
+            let grouping_rows = self.agg_ctx.create_grouping_rows(&batch)?;
+            self.map.upsert_records(
+                grouping_rows
+                    .iter()
+                    .map(|row| row.as_ref().as_raw_bytes())
+                    .collect(),
+            )
+        };
         self.agg_ctx.update_batch_to_acc_table(
             &batch,
             &mut self.acc_table,
@@ -545,6 +577,10 @@ impl HashingData {
         // sort all records using radix sort on hashcodes of keys
         let num_spill_buckets = self.agg_ctx.num_spill_buckets(self.mem_used());
         let key_rows = self.map.into_keys();
+        let key_rows = match self.primitive_grouping {
+            Some(grouping) => grouping.to_rows(&key_rows, &self.agg_ctx)?,
+            None => key_rows,
+        };
         let mut acc_table = self.acc_table;
         let mut entries = key_rows
             .iter()
@@ -586,6 +622,101 @@ impl HashingData {
         write_len(0, &mut writer)?;
         writer.finish()?;
         Ok(())
+    }
+}
+
+struct PrimitiveGrouping {
+    data_type: DataType,
+}
+
+impl PrimitiveGrouping {
+    fn try_new(data_type: &DataType, num_groupings: usize) -> Option<Self> {
+        if num_groupings != 1 {
+            return None;
+        }
+        match data_type {
+            DataType::Int32
+            | DataType::Int64
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(..) => Some(Self {
+                data_type: data_type.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn upsert_array(&self, array: &ArrayRef, map: &mut AggHashMap) -> Result<Vec<u32>> {
+        if array.data_type() != &self.data_type {
+            return df_execution_err!(
+                "primitive grouping type mismatch: expected {}, got {}",
+                self.data_type,
+                array.data_type()
+            );
+        }
+
+        let byte_width = self.byte_width();
+        let data = array.to_data();
+        let values = data.buffers()[0].as_slice();
+        let offset = data.offset();
+        Ok(map.upsert_records(
+            (0..array.len())
+                .map(|idx| {
+                    if array.is_null(idx) {
+                        &[][..]
+                    } else {
+                        let start = (offset + idx) * byte_width;
+                        &values[start..start + byte_width]
+                    }
+                })
+                .collect(),
+        ))
+    }
+
+    fn to_array(&self, keys: &[OwnedKey]) -> Result<ArrayRef> {
+        let byte_width = self.byte_width();
+        let mut values = MutableBuffer::new(keys.len() * byte_width);
+        let mut nulls = NullBufferBuilder::new(keys.len());
+        for key in keys {
+            if key.is_empty() {
+                values.extend_zeros(byte_width);
+                nulls.append_null();
+            } else if key.len() == byte_width {
+                values.extend_from_slice(key);
+                nulls.append_non_null();
+            } else {
+                return df_execution_err!(
+                    "invalid primitive grouping key width: expected {byte_width}, got {}",
+                    key.len()
+                );
+            }
+        }
+        let data = ArrayData::builder(self.data_type.clone())
+            .len(keys.len())
+            .add_buffer(values.into())
+            .nulls(nulls.finish())
+            .build()?;
+        Ok(make_array(data))
+    }
+
+    fn to_rows(&self, keys: &[OwnedKey], agg_ctx: &AggContext) -> Result<Vec<OwnedKey>> {
+        let array = self.to_array(keys)?;
+        let rows = agg_ctx
+            .grouping_row_converter
+            .lock()
+            .convert_columns(&[array])?;
+        Ok(rows
+            .iter()
+            .map(|row| OwnedKey::from_slice(row.as_ref().as_raw_bytes()))
+            .collect())
+    }
+
+    fn byte_width(&self) -> usize {
+        match self.data_type {
+            DataType::Int32 | DataType::Date32 => size_of::<i32>(),
+            DataType::Int64 | DataType::Date64 | DataType::Timestamp(..) => size_of::<i64>(),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -841,4 +972,58 @@ fn bucket_id(key: impl AsRef<[u8]>, num_spill_buckets: usize) -> u16 {
         foldhash::fast::FixedState::with_seed(AGG_HASH_SEED_HASHING as u64);
     let hash = HASHER.hash_one(key.as_ref()) as u32;
     (hash % num_spill_buckets as u32) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ArrayRef, AsArray, Int32Array},
+        datatypes::{DataType, Int32Type, TimeUnit},
+    };
+
+    use super::{AggHashMap, PrimitiveGrouping};
+
+    #[test]
+    fn primitive_grouping_supports_narrow_type_set() {
+        for data_type in [
+            DataType::Int32,
+            DataType::Int64,
+            DataType::Date32,
+            DataType::Date64,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ] {
+            assert!(PrimitiveGrouping::try_new(&data_type, 1).is_some());
+        }
+
+        assert!(PrimitiveGrouping::try_new(&DataType::Utf8, 1).is_none());
+        assert!(PrimitiveGrouping::try_new(&DataType::Float64, 1).is_none());
+        assert!(PrimitiveGrouping::try_new(&DataType::Int32, 2).is_none());
+    }
+
+    #[test]
+    fn primitive_grouping_upserts_values_and_nulls() {
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![
+            Some(0),
+            Some(10),
+            None,
+            Some(10),
+            Some(-2),
+            None,
+        ]));
+        let array = array.slice(1, 5);
+        let grouping = PrimitiveGrouping::try_new(&DataType::Int32, 1).unwrap();
+        let mut map = AggHashMap::default();
+
+        let indices = grouping.upsert_array(&array, &mut map).unwrap();
+
+        assert_eq!(indices, vec![0, 1, 0, 2, 1]);
+        let output = grouping.to_array(&map.into_keys()).unwrap();
+        let output = output.as_primitive::<Int32Type>();
+        assert_eq!(
+            output.iter().collect::<Vec<_>>(),
+            vec![Some(10), None, Some(-2)]
+        );
+    }
 }
