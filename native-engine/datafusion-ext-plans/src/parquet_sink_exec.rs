@@ -277,7 +277,7 @@ fn execute_parquet_sink(
                     let num_sub_batch_rows = (batch.num_rows() / num_sub_batches).max(16);
 
                     // split batch into current part and rest parts, then write current part
-                    let m = rfind_part_values(&batch, &part_values)?;
+                    let m = find_partition_end(&batch, &part_values)?;
                     let cur_batch = batch.slice(0, m);
                     batch = batch.slice(m, batch.num_rows() - m);
 
@@ -319,13 +319,19 @@ fn adapt_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> 
     )?)
 }
 
-fn rfind_part_values(batch: &RecordBatch, part_values: &[ScalarValue]) -> Result<usize> {
-    for row_idx in (0..batch.num_rows()).rev() {
-        if get_dyn_part_values(batch, part_values.len(), row_idx)? == part_values {
-            return Ok(row_idx + 1);
+fn find_partition_end(batch: &RecordBatch, part_values: &[ScalarValue]) -> Result<usize> {
+    if part_values.is_empty() {
+        return Ok(batch.num_rows());
+    }
+
+    // Dynamic partition columns are sorted, so the first mismatch ends the
+    // current partition.
+    for row_idx in 1..batch.num_rows() {
+        if get_dyn_part_values(batch, part_values.len(), row_idx)? != part_values {
+            return Ok(row_idx);
         }
     }
-    Ok(0)
+    Ok(batch.num_rows())
 }
 
 fn parse_writer_props(prop_kvs: &[(String, String)]) -> WriterProperties {
@@ -527,6 +533,32 @@ impl Write for FSDataWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{ArrayRef, Int32Array};
+
+    use super::*;
+
+    #[test]
+    fn test_find_partition_end() -> Result<()> {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "part_a",
+                Arc::new(Int32Array::from(vec![1, 1, 1, 1])) as ArrayRef,
+            ),
+            (
+                "part_b",
+                Arc::new(Int32Array::from(vec![None, None, Some(3), None])) as ArrayRef,
+            ),
+        ])?;
+
+        let first_partition = get_dyn_part_values(&batch, 2, 0)?;
+        assert_eq!(find_partition_end(&batch, &first_partition)?, 2);
+        assert_eq!(find_partition_end(&batch, &[])?, batch.num_rows());
         Ok(())
     }
 }
