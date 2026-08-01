@@ -49,7 +49,7 @@ import org.apache.spark.sql.catalyst.plans.LeftAnti
 import org.apache.spark.sql.catalyst.plans.LeftOuter
 import org.apache.spark.sql.catalyst.plans.LeftSemi
 import org.apache.spark.sql.catalyst.plans.RightOuter
-import org.apache.spark.sql.execution.ExecSubqueryExpression
+import org.apache.spark.sql.execution.{ExecSubqueryExpression, ScalarSubquery}
 import org.apache.spark.sql.execution.auron.arrowio.util.ArrowUtils
 import org.apache.spark.sql.execution.auron.arrowio.util.ArrowUtils.ROOT_ALLOCATOR
 import org.apache.spark.sql.execution.auron.arrowio.util.ArrowWriter
@@ -458,6 +458,13 @@ object NativeConverters extends Logging {
       case alias: Alias =>
         convertExprWithFallback(alias.child, isPruningExpr, fallback)
 
+      // A physical ScalarSubquery carries its entire SparkPlan, including RDD dependencies.
+      // Materialize it before conversion so only the result value crosses the native boundary.
+      case subquery: ScalarSubquery =>
+        prepareExecSubquery(subquery)
+        val literal = Literal.create(subquery.eval(InternalRow.empty), subquery.dataType)
+        convertExprWithFallback(literal, isPruningExpr, fallback)
+      
       // ScalarSubquery
       case subquery: ExecSubqueryExpression =>
         prepareExecSubquery(subquery)
