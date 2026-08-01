@@ -79,6 +79,26 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
     }
   }
 
+  test("scalar subquery in aggregate filter") {
+    withTable("scalar_subquery_source") {
+      sql("""
+          |CREATE TABLE scalar_subquery_source USING parquet AS
+          |SELECT CAST(id % 3 AS INT) AS group_id, CAST(id AS DOUBLE) AS value
+          |FROM range(30)
+          |""".stripMargin)
+      checkSparkAnswerAndOperator("""
+          |SELECT group_id, avg(value)
+          |FROM scalar_subquery_source
+          |GROUP BY group_id
+          |HAVING avg(value) > 0.9 * (
+          |  SELECT avg(value)
+          |  FROM scalar_subquery_source
+          |  WHERE group_id = 0
+          |  GROUP BY group_id)
+          |""".stripMargin)
+    }
+  }
+  
   test("test select multiple spark ext functions with the same signature") {
     withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
       withTable("t1") {
