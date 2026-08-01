@@ -464,7 +464,7 @@ object NativeConverters extends Logging {
         prepareExecSubquery(subquery)
         val literal = Literal.create(subquery.eval(InternalRow.empty), subquery.dataType)
         convertExprWithFallback(literal, isPruningExpr, fallback)
-      
+
       // ScalarSubquery
       case subquery: ExecSubqueryExpression =>
         prepareExecSubquery(subquery)
