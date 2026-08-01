@@ -98,7 +98,7 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
           |""".stripMargin)
     }
   }
-  
+
   test("test select multiple spark ext functions with the same signature") {
     withSQLConf("spark.auron.udf.singleChildFallback.enabled" -> "true") {
       withTable("t1") {
