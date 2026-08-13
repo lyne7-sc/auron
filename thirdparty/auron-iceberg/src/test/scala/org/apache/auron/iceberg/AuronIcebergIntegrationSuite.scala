@@ -154,6 +154,34 @@ class AuronIcebergIntegrationSuite
     }
   }
 
+  test("iceberg partition planning failure does not become an empty native scan") {
+    withTable("local.db.t_partition_planning_failure") {
+      sql("""
+            |create table local.db.t_partition_planning_failure (id int, v string)
+            |using iceberg
+            |""".stripMargin)
+      sql("insert into local.db.t_partition_planning_failure values (1, 'a')")
+
+      val df = sql("select * from local.db.t_partition_planning_failure")
+      val batchScan = df.queryExecution.sparkPlan
+        .collectFirst { case scan: BatchScanExec => scan }
+        .getOrElse(fail("Cannot find Iceberg BatchScanExec"))
+
+      val failingTaskGroups = new java.util.AbstractList[AnyRef] {
+        override def get(index: Int): AnyRef =
+          throw new IllegalStateException("injected partition planning failure")
+
+        override def size(): Int =
+          throw new IllegalStateException("injected partition planning failure")
+      }
+      val taskGroupsField = batchScan.scan.getClass.getSuperclass.getDeclaredField("taskGroups")
+      taskGroupsField.setAccessible(true)
+      taskGroupsField.set(batchScan.scan, failingTaskGroups)
+
+      assert(IcebergScanSupport.plan(batchScan.copy()).isEmpty)
+    }
+  }
+
   test("iceberg native scan is applied for projection on COW table") {
     withTable("local.db.t3") {
       sql("create table local.db.t3 using iceberg as select 1 as id, 'a' as v")

@@ -161,7 +161,10 @@ object IcebergScanSupport extends Logging {
         case None => return None
       }
 
-    val partitions = inputPartitions(exec, useRuntimeFilters)
+    val partitions = inputPartitions(exec, useRuntimeFilters) match {
+      case Some(p) => p
+      case None => return None
+    }
     // Empty scan (e.g. empty table) should still build a plan to return no rows.
     if (partitions.isEmpty) {
       logWarning(s"Native Iceberg scan planned with empty partitions for $scanClassName.")
@@ -243,7 +246,10 @@ object IcebergScanSupport extends Logging {
         case None => return None
       }
 
-    val partitions = inputPartitions(exec, useRuntimeFilters)
+    val partitions = inputPartitions(exec, useRuntimeFilters) match {
+      case Some(p) => p
+      case None => return None
+    }
     if (partitions.isEmpty) {
       return Some(
         IcebergScanPlan(
@@ -402,66 +408,65 @@ object IcebergScanSupport extends Logging {
 
   private def inputPartitions(
       exec: BatchScanExec,
-      useRuntimeFilters: Boolean): Seq[InputPartition] = {
+      useRuntimeFilters: Boolean): Option[Seq[InputPartition]] = {
     if (useRuntimeFilters) {
       runtimeFilteredPartitions(exec) match {
-        case Some(partitions) => return partitions
+        case Some(partitions) => return Some(partitions)
         case None =>
       }
     }
 
     // Prefer DataSource V2 batch API; if not available, fallback to exec methods via reflection.
-    val fromBatch =
-      try {
-        val batch = exec.scan.toBatch
-        if (batch != null) {
-          batch.planInputPartitions().toSeq
-        } else {
-          Seq.empty
+    try {
+      val batch = exec.scan.toBatch
+      if (batch != null) {
+        val partitions = batch.planInputPartitions()
+        if (partitions != null) {
+          return Some(partitions.toSeq)
         }
-      } catch {
-        case t: Throwable =>
-          logWarning(
-            s"Failed to plan input partitions via DataSource V2 batch API for " +
-              s"${exec.getClass.getName}; falling back to reflective methods.",
-            t)
-          Seq.empty
+        logWarning("Iceberg Scan.toBatch.planInputPartitions() returned null.")
+        return None
       }
-    if (fromBatch.nonEmpty) {
-      return fromBatch
+      logWarning("Iceberg Scan.toBatch returned null.")
+    } catch {
+      case NonFatal(t) =>
+        logWarning("Failed to plan Iceberg input partitions via Scan.toBatch.", t)
+        return None
     }
 
     // Some Spark versions expose partitions through inputPartitions/partitions methods on BatchScanExec.
     val methods = exec.getClass.getMethods
     val inputPartitionsMethod = methods.find(_.getName == "inputPartitions")
     val partitionsMethod = methods.find(_.getName == "partitions")
+    val method = inputPartitionsMethod.orElse(partitionsMethod)
+    if (method.isEmpty) {
+      logWarning(
+        "BatchScanExec exposes no inputPartitions/partitions method; cannot plan Iceberg scan.")
+      return None
+    }
 
     try {
-      val raw = inputPartitionsMethod
-        .orElse(partitionsMethod)
-        .map(_.invoke(exec))
-        .getOrElse(Seq.empty)
-
-      // Normalize to Seq[InputPartition], flattening nested Seq if needed.
-      raw match {
-        case seq: scala.collection.Seq[_]
+      method.map(_.invoke(exec)) match {
+        case Some(seq: scala.collection.Seq[_])
             if seq.nonEmpty &&
               seq.head.isInstanceOf[scala.collection.Seq[_]] =>
-          seq
-            .asInstanceOf[scala.collection.Seq[scala.collection.Seq[InputPartition]]]
-            .flatten
-            .toSeq
-        case seq: scala.collection.Seq[_] =>
-          seq.asInstanceOf[scala.collection.Seq[InputPartition]].toSeq
-        case _ =>
-          Seq.empty
+          Some(
+            seq
+              .asInstanceOf[scala.collection.Seq[scala.collection.Seq[InputPartition]]]
+              .flatten
+              .toSeq)
+        case Some(seq: scala.collection.Seq[_]) =>
+          Some(seq.asInstanceOf[scala.collection.Seq[InputPartition]].toSeq)
+        case other =>
+          logWarning(s"Unexpected return value from BatchScanExec partitions method: $other.")
+          None
       }
     } catch {
       case NonFatal(t) =>
         logWarning(
           s"Failed to obtain input partitions via reflection for ${exec.getClass.getName}.",
           t)
-        Seq.empty
+        None
     }
   }
 
