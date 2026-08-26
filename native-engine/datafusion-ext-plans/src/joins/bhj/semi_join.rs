@@ -153,7 +153,16 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
         probed_side_compare_time: &Time,
         build_output_time: &Time,
     ) -> Result<()> {
-        let mut probed_joined = bitvec![0; probed_batch.num_rows()];
+        let mut probed_joined = bitvec![0; if P.mode == Existence {
+            probed_batch.num_rows()
+        } else {
+            0
+        }];
+        let mut probed_indices = if P.probe_is_join_side && P.mode != Existence {
+            Vec::with_capacity(probed_batch.num_rows())
+        } else {
+            vec![]
+        };
         let map_joined = unsafe {
             // safety: ignore r/w conflicts with self.map
             std::mem::transmute::<_, &mut BitVec>(&mut self.map_joined)
@@ -200,15 +209,11 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                 .as_ref()
                 .map(|nb| nb.is_valid(row_idx))
                 .unwrap_or(true);
-            if P.mode == Anti
+            let mut joined = P.mode == Anti
                 && P.probe_is_join_side
                 && (!key_is_valid || build_has_null_keys) // Filter if probe row is NULL or build side has any NULL
-                && self.join_params.is_null_aware_anti_join
-            {
-                probed_joined.set(row_idx, true);
-                continue;
-            }
-            if key_is_valid {
+                && self.join_params.is_null_aware_anti_join;
+            if !joined && key_is_valid {
                 let map_value = map_values[hashes_idx];
                 hashes_idx += 1;
 
@@ -217,7 +222,7 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                         let map_idx = map_value.get_single();
                         if likely!(eq.eq(row_idx, map_idx as usize)) {
                             if P.probe_is_join_side {
-                                probed_joined.set(row_idx, true);
+                                joined = true;
                             } else {
                                 map_joined.set(map_idx as usize, true);
                             }
@@ -231,7 +236,7 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
 
                         if let Some(&map_idx) = eqs.next() {
                             if P.probe_is_join_side {
-                                probed_joined.set(row_idx, true);
+                                joined = true;
                             } else if !map_joined[map_idx as usize] {
                                 map_joined.set(map_idx as usize, true);
                                 for &map_idx in eqs {
@@ -244,6 +249,14 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                         }
                     }
                     _ => {} // map_value.is_empty()
+                }
+            }
+            if P.probe_is_join_side {
+                match P.mode {
+                    Semi if joined => probed_indices.push(row_idx as u32),
+                    Anti if !joined => probed_indices.push(row_idx as u32),
+                    Existence => probed_joined.set(row_idx, joined),
+                    _ => {}
                 }
             }
         }
@@ -263,15 +276,7 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                             .project_right(probed_batch.columns()),
                     };
                     let pcols = match P.mode {
-                        Semi | Anti => {
-                            let probed_indices = probed_joined
-                                .into_iter()
-                                .enumerate()
-                                .filter(|(_, joined)| (P.mode == Semi) ^ !joined)
-                                .map(|(idx, _)| idx as u32)
-                                .collect::<Vec<_>>();
-                            take_cols(&pprojected, probed_indices)?
-                        }
+                        Semi | Anti => take_cols(&pprojected, probed_indices)?,
                         Existence => {
                             let exists_col = Arc::new(BooleanArray::from(
                                 probed_joined.into_iter().collect::<Vec<_>>(),

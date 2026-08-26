@@ -292,6 +292,33 @@ mod tests {
         Ok((columns, batches))
     }
 
+    async fn bhj_null_aware_anti_collect(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+    ) -> Result<Vec<RecordBatch>> {
+        MemManager::init(1000000);
+        let task_ctx = SessionContext::new().task_ctx();
+        let schema = build_join_schema_for_test(&left.schema(), &right.schema(), LeftAnti)?;
+        let right = Arc::new(BroadcastJoinBuildHashMapExec::new(
+            right,
+            on.iter().map(|(_, right_key)| right_key.clone()).collect(),
+        ));
+        let join = BroadcastJoinExec::try_new(
+            schema,
+            left,
+            right,
+            on,
+            LeftAnti,
+            JoinSide::Right,
+            true,
+            None,
+            true,
+            None,
+        )?;
+        common::collect(join.execute(0, task_ctx)?).await
+    }
+
     async fn join_collect_with_batch_size(
         test_type: TestType,
         left: Arc<dyn ExecutionPlan>,
@@ -941,6 +968,86 @@ mod tests {
             // The output order is important as SMJ preserves sortedness
             assert_batches_sorted_eq!(expected, &batches);
         }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn join_semi_with_duplicate_build_keys() -> Result<()> {
+        let left = build_table(
+            ("a1", &vec![1, 2]),
+            ("b1", &vec![1, 3]),
+            ("c1", &vec![10, 20]),
+        )?;
+        let right = build_table(
+            ("a2", &vec![10, 11]),
+            ("b1", &vec![1, 1]),
+            ("c2", &vec![100, 101]),
+        )?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?),
+            Arc::new(Column::new_with_schema("b1", &right.schema())?),
+        )];
+
+        let (_, batches) = join_collect(BHJLeftProbed, left, right, on, LeftSemi).await?;
+        let expected = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 1  | 1  | 10 |",
+            "+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn join_null_aware_anti_with_null_probe_key() -> Result<()> {
+        let left = build_table_i32_nullable(
+            ("a1", &vec![Some(1), Some(2), Some(3)]),
+            ("b1", &vec![Some(1), Some(2), None]),
+            ("c1", &vec![Some(10), Some(20), Some(30)]),
+        )?;
+        let right = build_table_i32_nullable(
+            ("a2", &vec![Some(10), Some(40)]),
+            ("b1", &vec![Some(1), Some(4)]),
+            ("c2", &vec![Some(100), Some(400)]),
+        )?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?),
+            Arc::new(Column::new_with_schema("b1", &right.schema())?),
+        )];
+
+        let batches = bhj_null_aware_anti_collect(left, right, on).await?;
+        let expected = vec![
+            "+----+----+----+",
+            "| a1 | b1 | c1 |",
+            "+----+----+----+",
+            "| 2  | 2  | 20 |",
+            "+----+----+----+",
+        ];
+        assert_batches_sorted_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn join_null_aware_anti_with_null_build_key() -> Result<()> {
+        let left = build_table_i32_nullable(
+            ("a1", &vec![Some(1), Some(2)]),
+            ("b1", &vec![Some(2), Some(3)]),
+            ("c1", &vec![Some(10), Some(20)]),
+        )?;
+        let right = build_table_i32_nullable(
+            ("a2", &vec![Some(10), Some(40)]),
+            ("b1", &vec![Some(1), None]),
+            ("c2", &vec![Some(100), Some(400)]),
+        )?;
+        let on: JoinOn = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?),
+            Arc::new(Column::new_with_schema("b1", &right.schema())?),
+        )];
+
+        let batches = bhj_null_aware_anti_collect(left, right, on).await?;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
         Ok(())
     }
 
