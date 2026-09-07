@@ -163,21 +163,7 @@ fn bench_window_group_limit(
     b.iter(|| black_box(execute(&runtime, &task_ctx, &exec)));
 }
 
-#[bench]
-fn window_group_limit_row_number_slice(b: &mut Bencher) {
-    bench_window_group_limit(b, WindowRankType::RowNumber, 1, 100_000, 10, 10);
-}
-
-#[bench]
-fn window_group_limit_rank_slice(b: &mut Bencher) {
-    bench_window_group_limit(b, WindowRankType::Rank, 1, 100_000, 10, 10);
-}
-
-#[bench]
-fn window_group_limit_dense_rank_slice(b: &mut Bencher) {
-    bench_window_group_limit(b, WindowRankType::DenseRank, 1, 100_000, 10, 10);
-}
-
+// Multiple selected ranges: retain the first ranks from each of 100 partitions.
 #[bench]
 fn window_group_limit_row_number(b: &mut Bencher) {
     bench_window_group_limit(b, WindowRankType::RowNumber, 100, 1_000, 10, 10);
@@ -191,4 +177,26 @@ fn window_group_limit_rank(b: &mut Bencher) {
 #[bench]
 fn window_group_limit_dense_rank(b: &mut Bencher) {
     bench_window_group_limit(b, WindowRankType::DenseRank, 100, 1_000, 10, 10);
+}
+
+// One selected range: retain a prefix of a single 100,000-row partition.
+#[bench]
+fn window_group_limit_row_number_single_partition(b: &mut Bencher) {
+    bench_window_group_limit(b, WindowRankType::RowNumber, 1, 100_000, 1, 100);
+}
+
+#[bench]
+fn window_group_limit_rank_slice(b: &mut Bencher) {
+    bench_window_group_limit(b, WindowRankType::Rank, 1, 100_000, 10, 10);
+}
+
+#[bench]
+fn window_group_limit_dense_rank_slice(b: &mut Bencher) {
+    bench_window_group_limit(b, WindowRankType::DenseRank, 1, 100_000, 10, 10);
+}
+
+// All rows selected: adjacent ranges from 100 partitions merge into one.
+#[bench]
+fn window_group_limit_row_number_all_selected(b: &mut Bencher) {
+    bench_window_group_limit(b, WindowRankType::RowNumber, 100, 1_000, 1, 1_000);
 }
