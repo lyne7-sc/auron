@@ -18,26 +18,34 @@ use std::ops::Range;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
 
-use crate::window::{WindowRankType, window_context::WindowContext};
+use crate::window::{
+    WindowRankType,
+    processors::{rank_processor::RankProcessor, row_number_processor::RowNumberProcessor},
+    window_context::WindowContext,
+};
 
 pub(crate) struct WindowGroupLimitProcessor {
-    rank_type: WindowRankType,
+    processor: RankingProcessor,
     limit: i32,
-    cur_partition: Vec<u8>,
-    cur_order: Vec<u8>,
-    cur_rank: i32,
-    cur_equals: i32,
+}
+
+// RankProcessor handles both rank and dense_rank; row_number has its own
+// processor.
+enum RankingProcessor {
+    RowNumber(RowNumberProcessor),
+    Rank(RankProcessor),
 }
 
 impl WindowGroupLimitProcessor {
     pub(crate) fn new(rank_type: WindowRankType, limit: usize) -> Self {
+        let processor = match rank_type {
+            WindowRankType::RowNumber => RankingProcessor::RowNumber(RowNumberProcessor::new()),
+            WindowRankType::Rank => RankingProcessor::Rank(RankProcessor::new(false)),
+            WindowRankType::DenseRank => RankingProcessor::Rank(RankProcessor::new(true)),
+        };
         Self {
-            rank_type,
+            processor,
             limit: i32::try_from(limit).unwrap_or(i32::MAX),
-            cur_partition: vec![],
-            cur_order: vec![],
-            cur_rank: 0,
-            cur_equals: 1,
         }
     }
 
@@ -46,62 +54,21 @@ impl WindowGroupLimitProcessor {
         context: &WindowContext,
         batch: &RecordBatch,
     ) -> Result<Vec<Range<usize>>> {
-        let partition_rows = context.get_partition_rows(batch)?;
-        let order_rows = match self.rank_type {
-            WindowRankType::RowNumber => None,
-            WindowRankType::Rank | WindowRankType::DenseRank => {
-                Some(context.get_order_rows(batch)?)
-            }
-        };
         let mut selected_ranges = vec![];
         let mut selected_start = None;
-
-        for row_idx in 0..batch.num_rows() {
-            let same_partition = !context.has_partition() || {
-                let partition_row = partition_rows.row(row_idx);
-                if partition_row.as_ref() != self.cur_partition {
-                    self.cur_partition = partition_row.as_ref().into();
-                    false
-                } else {
-                    true
-                }
-            };
-
-            match self.rank_type {
-                WindowRankType::RowNumber => {
-                    if !same_partition {
-                        self.cur_rank = 0;
-                    }
-                    self.cur_rank += 1;
-                }
-                WindowRankType::Rank | WindowRankType::DenseRank => {
-                    let order_row = order_rows
-                        .as_ref()
-                        .expect("rank and dense_rank must have order rows")
-                        .row(row_idx);
-                    if same_partition {
-                        if order_row.as_ref() == self.cur_order {
-                            self.cur_equals += 1;
-                        } else {
-                            self.cur_rank += match self.rank_type {
-                                WindowRankType::Rank => self.cur_equals,
-                                WindowRankType::DenseRank => 1,
-                                WindowRankType::RowNumber => unreachable!(),
-                            };
-                            self.cur_equals = 1;
-                            self.cur_order = order_row.as_ref().into();
-                        }
-                    } else {
-                        self.cur_rank = 1;
-                        self.cur_equals = 1;
-                        self.cur_order = order_row.as_ref().into();
-                    }
-                }
-            }
-            if self.cur_rank <= self.limit {
+        let mut collect_range = |row_idx, rank| {
+            if rank <= self.limit {
                 selected_start.get_or_insert(row_idx);
             } else if let Some(start) = selected_start.take() {
                 selected_ranges.push(start..row_idx);
+            }
+        };
+        match &mut self.processor {
+            RankingProcessor::RowNumber(processor) => {
+                processor.process_batch_with(context, batch, &mut collect_range)?;
+            }
+            RankingProcessor::Rank(processor) => {
+                processor.process_batch_with(context, batch, &mut collect_range)?;
             }
         }
         if let Some(start) = selected_start {
