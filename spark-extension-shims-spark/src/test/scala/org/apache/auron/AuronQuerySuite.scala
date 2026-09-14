@@ -953,6 +953,62 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
     }
   }
 
+  for {
+    strategy <- Seq("BROADCAST", "SHUFFLE_HASH")
+    (keyType, keyExpr) <- Seq(
+      "array" -> "array(v, w)",
+      "struct" -> "named_struct('v', v, 'w', w)",
+      "array of struct" ->
+        "array(named_struct('v', v, 'w', w), cast(null as struct<v:int,w:int>))")
+    joinType <- Seq("INNER", "LEFT OUTER", "LEFT SEMI", "LEFT ANTI")
+  } {
+    test(s"native hash join nested null keys: $strategy, $keyType, $joinType") {
+      withSQLConf(
+        "spark.sql.adaptive.enabled" -> "false",
+        "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+        "spark.sql.shuffle.partitions" -> "2") {
+        withTable("nested_left", "nested_right") {
+          // Materialize keys so both engines compare values read from Parquet.
+          // Swapping null and zero preserves the hash but must not make keys equal.
+          withSQLConf("spark.auron.enable" -> "false") {
+            sql(s"""
+                   |CREATE TABLE nested_left USING parquet AS
+                   |SELECT id, CASE WHEN id = 5 THEN null ELSE $keyExpr END AS k
+                   |FROM VALUES (1, null, 1), (2, 0, 1), (3, 1, null), (4, 2, 3),
+                   |            (5, null, null), (6, null, 1), (7, null, 0), (8, 0, null)
+                   |AS t(id, v, w)
+                   |""".stripMargin)
+            sql(s"""
+                   |CREATE TABLE nested_right USING parquet AS
+                   |SELECT id, CASE WHEN id = 5 THEN null ELSE $keyExpr END AS k
+                   |FROM VALUES (1, null, 1), (2, 0, 1), (3, 1, null), (4, 3, 2),
+                   |            (5, null, null), (6, null, 1), (7, 4, 5), (8, 0, null)
+                   |AS t(id, v, w)
+                   |""".stripMargin)
+          }
+
+          val projection = if (joinType == "INNER" || joinType == "LEFT OUTER") {
+            "l.id, r.id"
+          } else {
+            "l.id"
+          }
+          val df = checkSparkAnswerAndOperator(s"""
+                 |SELECT /*+ $strategy(r) */ $projection
+                 |FROM nested_left l $joinType JOIN nested_right r ON l.k = r.k
+                 |""".stripMargin)
+          val plan = stripAQEPlan(df.queryExecution.executedPlan)
+          val hasExpectedJoin = strategy match {
+            case "BROADCAST" =>
+              plan.collectFirst { case _: NativeBroadcastJoinExec => true }.isDefined
+            case "SHUFFLE_HASH" =>
+              plan.collectFirst { case _: NativeShuffledHashJoinBase => true }.isDefined
+          }
+          assert(hasExpectedJoin, s"expected native $strategy join, but got:\n$plan")
+        }
+      }
+    }
+  }
+
   test("native broadcast hash join rejects non-inner residual condition") {
     withSQLConf("spark.sql.adaptive.enabled" -> "false") {
       withTable("bhj_left", "bhj_right") {
