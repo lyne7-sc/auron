@@ -1,0 +1,138 @@
+Subject: [PATCH] auron: preserve decimal scale in parquet dictionary pruning
+
+Parquet integer dictionaries contain unscaled decimal values. Preserve the
+logical precision and scale before the pruning statistics cast, so a value of
+10.00 stored as 1000 is not incorrectly compared as 1000.00.
+
+diff --git a/parquet/src/auron.rs b/parquet/src/auron.rs
+index 2c86f045a1ec39b0d17c495059dce9491a7db2c5..16e7106b40afe117490bd600ded95a7812e85ea2 100644
+--- a/parquet/src/auron.rs
++++ b/parquet/src/auron.rs
+@@ -94,9 +94,22 @@ pub fn get_dictionary_for_pruning<T: AsyncFileReader + Send + 'static>(
+                         column_metadata.column_descr().type_length());
+                     dict_decoder.set_data(buf, num_values as usize)?;
+                     dict_decoder.get(&mut dict_values)?;
+-                    Ok(Some(
+-                        Arc::new(<$array_type>::from_iter_values(dict_values))
+-                    ))
++                    let array: ArrayRef =
++                        Arc::new(<$array_type>::from_iter_values(dict_values));
++                    let descriptor = column_metadata.column_descr();
++                    if descriptor.converted_type() == crate::basic::ConvertedType::DECIMAL {
++                        // Dictionary integers are unscaled decimal values. Attach the file
++                        // scale after widening, rather than numerically casting to that scale.
++                        let decimal = arrow_cast::cast(&array, &DataType::Decimal128(38, 0))?;
++                        let decimal = Decimal128Array::from(decimal.to_data())
++                            .with_precision_and_scale(
++                                descriptor.type_precision() as u8,
++                                descriptor.type_scale() as i8,
++                            )?;
++                        Ok(Some(Arc::new(decimal) as ArrayRef))
++                    } else {
++                        Ok(Some(array))
++                    }
+                 }
+                 _ => {
+                     Ok(None)
+@@ -215,6 +228,10 @@ mod test {
+ 
+     struct AsyncLocalFileReader(File);
+     impl AsyncFileReader for AsyncLocalFileReader {
++        fn get_bytes_sync(&mut self, range: Range<u64>) -> crate::errors::Result<Bytes> {
++            self.0.get_bytes(range.start, (range.end - range.start) as usize)
++        }
++
+         fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, crate::errors::Result<Bytes>> {
+             Box::pin(async move {
+                 Ok(self.0.get_bytes(range.start, (range.end - range.start) as usize)?)
+@@ -243,6 +260,90 @@ mod test {
+         }
+     }
+ 
++    fn check_decimal_dictionary<T: crate::data_type::DataType>(
++        precision: u8,
++        values: &[T::T],
++        expected: &[i128],
++    ) -> crate::errors::Result<()> {
++        use crate::basic::{Encoding, PageType};
++        use crate::column::page::{CompressedPage, Page, PageWriter};
++        use crate::encodings::encoding::{Encoder, PlainEncoder};
++        use crate::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
++        use crate::file::page_encoding_stats::PageEncodingStats;
++        use crate::file::writer::{SerializedPageWriter, TrackedWrite};
++        use crate::schema::{parser::parse_message_type, types::SchemaDescriptor};
++        use arrow_array::Decimal128Array;
++
++        let schema = Arc::new(SchemaDescriptor::new(Arc::new(parse_message_type(
++            &format!(
++                "message schema {{ REQUIRED {} amount (DECIMAL({precision}, 2)); }}",
++                T::get_physical_type(),
++            ),
++        )?)));
++        let mut encoder = PlainEncoder::<T>::new();
++        encoder.put(values)?;
++        let encoded = encoder.flush_buffer()?;
++        let size = encoded.len();
++        let page = Page::DictionaryPage {
++            buf: encoded,
++            num_values: values.len() as u32,
++            encoding: Encoding::PLAIN_DICTIONARY,
++            is_sorted: false,
++        };
++        let mut file = tempfile::tempfile()?;
++        let mut sink = TrackedWrite::new(&mut file);
++        let spec = SerializedPageWriter::new(&mut sink).write_page(CompressedPage::new(page, size))?;
++        drop(sink);
++        let column = ColumnChunkMetaData::builder(schema.column(0))
++            .set_num_values(values.len() as i64)
++            .set_encodings(vec![Encoding::PLAIN_DICTIONARY])
++            .set_page_encoding_stats(vec![PageEncodingStats {
++                page_type: PageType::DICTIONARY_PAGE,
++                encoding: Encoding::PLAIN_DICTIONARY,
++                count: 1,
++            }])
++            .set_dictionary_page_offset(Some(0))
++            .set_total_compressed_size(spec.compressed_size as i64)
++            .set_total_uncompressed_size(spec.uncompressed_size as i64)
++            .build()?;
++        let row_group = RowGroupMetaData::builder(schema)
++            .set_num_rows(values.len() as i64)
++            .set_column_metadata(vec![column])
++            .build()?;
++        let dictionary = get_dictionary_for_pruning(&mut AsyncLocalFileReader(file), &row_group, 0)?
++            .expect("decimal dictionary must be available for pruning");
++        let data_type = DataType::Decimal128(precision, 2);
++        let cast_dictionary = cast(&dictionary, &data_type)?;
++        let decimals = cast_dictionary
++            .as_any()
++            .downcast_ref::<Decimal128Array>()
++            .unwrap();
++        assert_eq!(
++            decimals,
++            &Decimal128Array::from(expected.to_vec()).with_precision_and_scale(precision, 2)?,
++        );
++        assert_eq!(dictionary.data_type(), &data_type);
++        Ok(())
++    }
++
++    #[test]
++    fn test_decimal_int32_dictionary_scale() -> crate::errors::Result<()> {
++        check_decimal_dictionary::<crate::data_type::Int32Type>(
++            9,
++            &[-1025, 0, 1025, 999999999],
++            &[-1025, 0, 1025, 999999999],
++        )
++    }
++
++    #[test]
++    fn test_decimal_int64_dictionary_scale() -> crate::errors::Result<()> {
++        check_decimal_dictionary::<crate::data_type::Int64Type>(
++            18,
++            &[-1025, 0, 1025, 999999999999999999],
++            &[-1025, 0, 1025, 999999999999999999],
++        )
++    }
++
+     #[tokio::test]
+     async fn test_get_dictionary() -> crate::errors::Result<()> {
+         let input = AsyncLocalFileReader(
