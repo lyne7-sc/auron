@@ -747,6 +747,55 @@ class ShimsImpl extends Shims with Logging {
     expr.asInstanceOf[NextDay].failOnError
   }
 
+  @sparkver("3.0 / 3.1")
+  override def getAggregateEvalMode(expr: AggregateFunction): String = {
+    if (org.apache.spark.sql.internal.SQLConf.get.ansiEnabled) "ANSI" else "LEGACY"
+  }
+
+  @sparkver("3.2")
+  override def getAggregateEvalMode(expr: AggregateFunction): String = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Sum}
+    expr match {
+      case e: Sum => if (e.failOnError) "ANSI" else "LEGACY"
+      case e: Average => if (e.failOnError) "ANSI" else "LEGACY"
+      case other =>
+        throw new NotImplementedError(s"evaluation mode not supported for aggregate: $other")
+    }
+  }
+
+  @sparkver("3.3")
+  override def getAggregateEvalMode(expr: AggregateFunction): String = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Sum}
+    expr match {
+      case e: Sum => if (e.useAnsiAdd) "ANSI" else "LEGACY"
+      case e: Average => if (e.useAnsiAdd) "ANSI" else "LEGACY"
+      case other =>
+        throw new NotImplementedError(s"evaluation mode not supported for aggregate: $other")
+    }
+  }
+
+  @sparkver("3.4 / 3.5 / 4.0")
+  override def getAggregateEvalMode(expr: AggregateFunction): String = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Sum}
+    expr match {
+      case e: Sum => e.evalMode.toString
+      case e: Average => e.evalMode.toString
+      case other =>
+        throw new NotImplementedError(s"evaluation mode not supported for aggregate: $other")
+    }
+  }
+
+  @sparkver("4.1 / 4.2")
+  override def getAggregateEvalMode(expr: AggregateFunction): String = {
+    import org.apache.spark.sql.catalyst.expressions.aggregate.{Average, Sum}
+    expr match {
+      case e: Sum => e.evalContext.evalMode.toString
+      case e: Average => e.evalMode.toString
+      case other =>
+        throw new NotImplementedError(s"evaluation mode not supported for aggregate: $other")
+    }
+  }
+
   override def convertMoreAggregateExpr(e: AggregateExpression): Option[pb.PhysicalExprNode] = {
     e.aggregateFunction match {
       case First(child, ignoresNull) =>

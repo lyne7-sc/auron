@@ -39,6 +39,7 @@ import org.apache.spark.sql.catalyst.expressions.Generator
 import org.apache.spark.sql.catalyst.expressions.NamedExpression
 import org.apache.spark.sql.catalyst.expressions.SortOrder
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateFunction
 import org.apache.spark.sql.catalyst.plans.JoinType
 import org.apache.spark.sql.catalyst.plans.physical.BroadcastMode
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
@@ -251,6 +252,8 @@ abstract class Shims {
   def getMakeDateFailOnError(expr: Expression): Boolean
 
   def getNextDayFailOnError(expr: Expression): Boolean
+
+  def getAggregateEvalMode(expr: AggregateFunction): String
 
   def getAggregateExpressionFilter(expr: Expression): Option[Expression]
 
