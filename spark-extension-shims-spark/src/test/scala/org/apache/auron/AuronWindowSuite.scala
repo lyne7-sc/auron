@@ -17,11 +17,34 @@
 package org.apache.auron
 
 import org.apache.spark.sql.AuronQueryTest
-import org.apache.spark.sql.execution.auron.plan.NativeWindowBase
+import org.apache.spark.sql.execution.auron.plan.{NativeWindowBase, NativeWindowExec}
 
 import org.apache.auron.util.AuronTestUtils
 
 class AuronWindowSuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQLTestHelper {
+
+  test("min/max/count cumulative ROWS windows execute natively") {
+    withSQLConf("spark.auron.enable.window" -> "true", "spark.auron.batchSize" -> "2") {
+      withTable("window_aggregates") {
+        sql("create table window_aggregates(id int, k int, v int) using parquet")
+        sql(
+          "insert into window_aggregates values " +
+            "(1,1,null),(2,1,20),(3,1,10),(4,2,null),(5,2,null),(6,3,7),(7,null,13)")
+        for {
+          partition <- Seq("partition by k", "")
+          value <- Seq("v", "cast(v as double)", "cast(v as decimal(12,2))", "cast(v as string)")
+        } {
+          val frame = s"$partition order by id rows between unbounded preceding and current row"
+          val df = checkSparkAnswer(
+            s"select id,min($value) over ($frame),max($value) over ($frame)," +
+              s"count($value) over ($frame),count(*) over ($frame) " +
+              "from window_aggregates")
+          val plan = stripAQEPlan(df.queryExecution.executedPlan)
+          assert(plan.collectFirst { case _: NativeWindowExec => true }.nonEmpty, plan.toString)
+        }
+      }
+    }
+  }
 
   test("lead window function") {
     withSQLConf("spark.auron.enable.window" -> "true") {
