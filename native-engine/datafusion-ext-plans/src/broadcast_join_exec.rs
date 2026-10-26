@@ -485,15 +485,18 @@ async fn execute_join_with_smj_fallback(
     };
 
     // run sort merge join
-    let smj_exec = Arc::new(SortMergeJoinExec::try_new(
-        join_params.output_schema,
-        left_exec.clone(),
-        right_exec.clone(),
-        left_keys.iter().cloned().zip(right_keys).collect(),
-        join_params.join_type,
-        join_params.join_filter.clone(),
-        vec![SortOptions::default(); left_keys.len()],
-    )?);
+    let smj_exec = Arc::new(
+        SortMergeJoinExec::try_new(
+            join_params.output_schema,
+            left_exec.clone(),
+            right_exec.clone(),
+            left_keys.iter().cloned().zip(right_keys).collect(),
+            join_params.join_type,
+            join_params.join_filter.clone(),
+            vec![SortOptions::default(); left_keys.len()],
+        )?
+        .with_null_aware_anti_join(join_params.is_null_aware_anti_join)?,
+    );
     let mut projection = match join_params.join_type {
         Inner | Left | Right | Full => join_params
             .projection

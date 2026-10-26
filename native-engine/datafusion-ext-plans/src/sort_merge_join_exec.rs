@@ -62,6 +62,7 @@ pub struct SortMergeJoinExec {
     join_type: JoinType,
     sort_options: Vec<SortOptions>,
     join_filter: Option<JoinFilter>,
+    is_null_aware_anti_join: bool,
     join_params: OnceCell<JoinParams>,
     schema: SchemaRef,
     metrics: ExecutionPlanMetricsSet,
@@ -86,10 +87,27 @@ impl SortMergeJoinExec {
             join_type,
             sort_options,
             join_filter,
+            is_null_aware_anti_join: false,
             join_params: OnceCell::new(),
             metrics: ExecutionPlanMetricsSet::new(),
             props: OnceCell::new(),
         })
+    }
+
+    pub(crate) fn with_null_aware_anti_join(mut self, enabled: bool) -> Result<Self> {
+        if enabled
+            && (self.join_type != LeftAnti
+                || self.on.len() != 1
+                || self.sort_options.len() != 1
+                || !self.sort_options[0].nulls_first
+                || self.join_filter.is_some())
+        {
+            return df_execution_err!(
+                "NULL-aware anti join requires a single key, LeftAnti, NULLs first, and no filter"
+            );
+        }
+        self.is_null_aware_anti_join = enabled;
+        Ok(self)
     }
 
     fn create_join_params(&self, projection: &[usize]) -> Result<JoinParams> {
@@ -140,7 +158,7 @@ impl SortMergeJoinExec {
             join_filter: self.join_filter.clone(),
             residual_filter: None,
             batch_size: batch_size(),
-            is_null_aware_anti_join: false,
+            is_null_aware_anti_join: self.is_null_aware_anti_join,
             output_time: Time::new(),
         })
     }
@@ -287,15 +305,18 @@ impl ExecutionPlan for SortMergeJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(SortMergeJoinExec::try_new(
-            self.schema(),
-            children[0].clone(),
-            children[1].clone(),
-            self.on.clone(),
-            self.join_type,
-            self.join_filter.clone(),
-            self.sort_options.clone(),
-        )?))
+        Ok(Arc::new(
+            SortMergeJoinExec::try_new(
+                self.schema(),
+                children[0].clone(),
+                children[1].clone(),
+                self.on.clone(),
+                self.join_type,
+                self.join_filter.clone(),
+                self.sort_options.clone(),
+            )?
+            .with_null_aware_anti_join(self.is_null_aware_anti_join)?,
+        ))
     }
 
     fn execute(
@@ -342,6 +363,19 @@ async fn execute_join(
     drop(concurrent_poll_timer);
     poll_time.sub_duration(poll_time.duration());
     poll_time.add_duration(concurrent_poll_time.duration());
+
+    if join_params.is_null_aware_anti_join && !right.finished() {
+        // With one key sorted NULLs first, the first right row determines
+        // whether NOT IN must reject every left row.
+        if right.is_null_key(right.cur_idx()) {
+            return Ok(());
+        }
+        // NULL probe keys survive only when the right side is empty.
+        while !left.finished() && left.is_null_key(left.cur_idx()) {
+            cur_forward!(left);
+            left.clean_batches_before(left.cur_idx().0);
+        }
+    }
 
     macro_rules! join {
         ($joiner:ty) => {{

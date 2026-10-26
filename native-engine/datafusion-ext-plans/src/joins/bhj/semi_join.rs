@@ -246,6 +246,7 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                 .unwrap_or(true);
             if P.mode == Anti
                 && P.probe_is_join_side
+                && map.data_batch().num_rows() > 0
                 && (!key_is_valid || build_has_null_keys) // Filter if probe row is NULL or build side has any NULL
                 && self.join_params.is_null_aware_anti_join
             {

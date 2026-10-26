@@ -265,6 +265,119 @@ async fn duplicate_key_candidates_stay_bounded() -> Result<()> {
 }
 
 #[tokio::test]
+async fn null_aware_anti_join_hash_and_smj_fallback() -> Result<()> {
+    use auron_memmgr::MemManager;
+    use datafusion::{
+        common::JoinSide,
+        physical_plan::{ExecutionPlan, common::collect, test::TestMemoryExec},
+    };
+
+    use crate::{
+        broadcast_join_exec::BroadcastJoinExec, common::column_pruning::ExecuteWithColumnPruning,
+        sort_merge_join_exec::SortMergeJoinExec,
+    };
+
+    MemManager::init(1000000);
+    let left_schema = Arc::new(Schema::new(vec![Field::new("lk", DataType::Int32, true)]));
+    let right_schema = Arc::new(Schema::new(vec![Field::new("rk", DataType::Int32, true)]));
+    let left = RecordBatch::try_new(
+        left_schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![
+            None,
+            None,
+            Some(1),
+            Some(2),
+        ]))],
+    )?;
+    let memory = |batch: RecordBatch| -> Result<Arc<dyn ExecutionPlan>> {
+        let batches = (0..batch.num_rows())
+            .map(|i| batch.slice(i, 1))
+            .collect::<Vec<_>>();
+        Ok(Arc::new(TestMemoryExec::try_new(
+            &[batches],
+            batch.schema(),
+            None,
+        )?))
+    };
+
+    for (right_keys, expected) in [
+        (vec![], vec![None, None, Some(1), Some(2)]),
+        (vec![Some(1)], vec![Some(2)]),
+        (vec![None], vec![]),
+        (vec![None, Some(1)], vec![]),
+    ] {
+        let right = RecordBatch::try_new(
+            right_schema.clone(),
+            vec![Arc::new(Int32Array::from(right_keys))],
+        )?;
+        let on = vec![(
+            Arc::new(Column::new("lk", 0)) as PhysicalExprRef,
+            Arc::new(Column::new("rk", 0)) as PhysicalExprRef,
+        )];
+        for fallback in [false, true] {
+            if fallback && right.num_rows() == 0 {
+                continue;
+            }
+            let built = if fallback {
+                let schema = crate::joins::join_hash_map::join_hash_map_schema(&right_schema);
+                memory(RecordBatch::try_new(
+                    schema,
+                    vec![
+                        right.column(0).clone(),
+                        arrow::array::new_null_array(&DataType::Binary, right.num_rows()),
+                    ],
+                )?)?
+            } else {
+                memory(right.clone())?
+            };
+            let join = BroadcastJoinExec::try_new(
+                left_schema.clone(),
+                memory(left.clone())?,
+                built,
+                on.clone(),
+                JoinType::LeftAnti,
+                JoinSide::Right,
+                fallback,
+                None,
+                true,
+                None,
+            )?;
+            let output =
+                collect(join.execute_projected(0, SessionContext::new().task_ctx(), &[0])?).await?;
+            let actual = arrow::compute::concat_batches(&left_schema, &output)?;
+            let expected = RecordBatch::try_new(
+                left_schema.clone(),
+                vec![Arc::new(Int32Array::from(expected.clone()))],
+            )?;
+            assert_eq!(
+                actual,
+                expected,
+                "right rows: {}, fallback={fallback}",
+                right.num_rows()
+            );
+        }
+
+        if right.num_rows() == 0 {
+            // An empty right side must retain NULL keys on the SMJ path too.
+            let smj = SortMergeJoinExec::try_new(
+                left_schema.clone(),
+                memory(left.clone())?,
+                memory(right)?,
+                on,
+                JoinType::LeftAnti,
+                None,
+                vec![Default::default()],
+            )?
+            .with_null_aware_anti_join(true)?;
+            let output =
+                collect(smj.execute_projected(0, SessionContext::new().task_ctx(), &[0])?).await?;
+            assert_eq!(arrow::compute::concat_batches(&left_schema, &output)?, left);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn residual_hash_join_operator_and_spill_parity() -> Result<()> {
     use arrow::array::{ArrayRef, new_null_array};
     use auron_memmgr::MemManager;
