@@ -21,7 +21,7 @@ use datafusion::common::Result;
 use datafusion_ext_commons::arrow::selection::create_batch_interleaver;
 
 use crate::{
-    common::execution_context::WrappedRecordBatchSender,
+    common::execution_context::{WrappedRecordBatchSender, WrappedSenderTrait},
     joins::{
         Idx, IdxRange, JoinParams,
         join_filter::RunBatch,
@@ -325,17 +325,13 @@ impl<const P: JoinerParams> SemiJoiner<P> {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
-    async fn join(
+    pub(super) async fn join_with_merger(
         mut self: Pin<&mut Self>,
         cur1: &mut StreamCursor,
         cur2: &mut StreamCursor,
+        mut merger: GroupMerger,
     ) -> Result<()> {
-        let mut merger = GroupMerger::new();
-
         while let Some(action) = merger.next(cur1, cur2).await? {
             // Note: the group slices below live inside the merger and are invalidated by
             // the next `next` / `release_batches` call
@@ -349,6 +345,22 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
                     self.as_mut()
                         .emit_unmatched(cur1, cur2, R, merger.rgroup())
                         .await?
+                }
+                GroupAction::SpillRequired => {
+                    self.as_mut().flush(cur1, cur2).await?;
+                    let sender = self.output_sender.clone();
+                    let (left, right) = merger
+                        .spill_group(
+                            cur1,
+                            cur2,
+                            self.join_params.batch_size,
+                            sender.exec_ctx().spill_metrics(),
+                        )
+                        .await?;
+                    let rows =
+                        super::spill::join_spilled_group(left, right, &self.join_params, &sender)
+                            .await?;
+                    self.output_rows += rows;
                 }
                 GroupAction::Both => {
                     self.as_mut()
@@ -369,6 +381,17 @@ impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
         }
         self.flush(cur1, cur2).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<const P: JoinerParams> Joiner for SemiJoiner<P> {
+    async fn join(
+        self: Pin<&mut Self>,
+        cur1: &mut StreamCursor,
+        cur2: &mut StreamCursor,
+    ) -> Result<()> {
+        self.join_with_merger(cur1, cur2, GroupMerger::new()).await
     }
 
     fn num_output_rows(&self) -> usize {

@@ -23,7 +23,7 @@ use arrow::{
 };
 use arrow_schema::DataType;
 use datafusion::{common::Result, physical_plan::metrics::Time};
-use datafusion_ext_commons::arrow::selection::take_batch;
+use datafusion_ext_commons::arrow::{array_size::BatchSize, selection::take_batch};
 use futures::StreamExt;
 
 use crate::{
@@ -49,6 +49,8 @@ pub struct StreamCursor {
     keys: Vec<Arc<Rows>>,
     key_has_nulls: Vec<Option<NullBuffer>>,
     pub finished: bool,
+    buffered_mem_size: usize,
+    batch_mem_sizes: Vec<usize>,
 }
 
 impl StreamCursor {
@@ -89,6 +91,8 @@ impl StreamCursor {
             keys: vec![empty_keys],
             key_has_nulls: vec![Some(null_nb)],
             finished: false,
+            buffered_mem_size: 0,
+            batch_mem_sizes: vec![0],
         })
     }
 }
@@ -121,6 +125,11 @@ impl StreamCursor {
                     .filter(|nb| nb.null_count() > 0);
                     let batch = batch_with_keys.batch;
 
+                    let mem_size = batch.get_batch_mem_size()
+                        + keys.size()
+                        + key_has_nulls.as_ref().map_or(0, |nb| nb.buffer().len());
+                    self.buffered_mem_size += mem_size;
+                    self.batch_mem_sizes.push(mem_size);
                     self.batches.push(batch);
                     self.key_has_nulls.push(key_has_nulls);
                     self.keys.push(keys);
@@ -168,6 +177,14 @@ impl StreamCursor {
         self.batches.len() - 1
     }
 
+    pub fn buffered_mem_size(&self) -> usize {
+        self.buffered_mem_size
+    }
+
+    pub fn batch_mem_size(&self, batch_idx: usize) -> usize {
+        self.batch_mem_sizes[batch_idx]
+    }
+
     #[inline]
     pub fn cur_batch_num_rows(&self) -> usize {
         self.batches[self.cur_idx.0].num_rows()
@@ -202,6 +219,9 @@ impl StreamCursor {
         let first_needed = first_needed.min(self.cur_idx.0).max(1);
         let shift = first_needed - 1;
         if shift > 0 {
+            self.buffered_mem_size -= self.batch_mem_sizes[1..first_needed].iter().sum::<usize>();
+            self.batch_mem_sizes
+                .splice(1..first_needed, std::iter::empty());
             self.batches.splice(1..first_needed, std::iter::empty());
             self.keys.splice(1..first_needed, std::iter::empty());
             self.key_has_nulls

@@ -101,9 +101,15 @@ pub fn try_new_spill(spill_metrics: &SpillMetrics) -> Result<Box<dyn Spill>> {
     }
 }
 
+/// Create replayable storage. On-heap spills may be consumed while reading,
+/// so operators which revisit their input must use a file instead.
+pub fn try_new_file_spill(spill_metrics: &SpillMetrics) -> Result<Box<dyn Spill>> {
+    Ok(Box::new(FileSpill::try_new(spill_metrics)?))
+}
+
 /// A spill structure which write data to temporary files
 /// used in driver side or executor side with on-heap memory is full
-struct FileSpill(File, SpillMetrics, Option<String>);
+struct FileSpill(File, SpillMetrics, Option<String>, Time);
 impl FileSpill {
     fn try_new(spill_metrics: &SpillMetrics) -> Result<Self> {
         if is_jni_bridge_inited() {
@@ -118,10 +124,15 @@ impl FileSpill {
                 .write(true)
                 .read(true)
                 .open(&file_name)?;
-            Ok(Self(file, spill_metrics.clone(), Some(file_name)))
+            Ok(Self(
+                file,
+                spill_metrics.clone(),
+                Some(file_name),
+                Time::new(),
+            ))
         } else {
             let file = tempfile::tempfile()?;
-            Ok(Self(file, spill_metrics.clone(), None))
+            Ok(Self(file, spill_metrics.clone(), None, Time::new()))
         }
     }
 }
@@ -142,7 +153,7 @@ impl Spill for FileSpill {
         BufReader::with_capacity(
             65536,
             Box::new(IoTimeReadWrapper(
-                file_cloned,
+                IoTimeReadWrapper(file_cloned, self.3.clone()),
                 self.1.mem_spill_iotime.clone(),
             )),
         )
@@ -153,7 +164,7 @@ impl Spill for FileSpill {
         BufWriter::with_capacity(
             65536,
             Box::new(IoTimeWriteWrapper(
-                file_cloned,
+                IoTimeWriteWrapper(file_cloned, self.3.clone()),
                 self.1.mem_spill_iotime.clone(),
             )),
         )
@@ -163,9 +174,12 @@ impl Spill for FileSpill {
 impl Drop for FileSpill {
     fn drop(&mut self) {
         self.1.disk_spill_size.add(self.0.len() as usize);
-        self.1
-            .disk_spill_iotime
-            .add_duration(Duration::from_nanos(self.1.mem_spill_iotime.value() as u64));
+        let io_nanos = self.3.value();
+        if io_nanos > 0 {
+            self.1
+                .disk_spill_iotime
+                .add_duration(Duration::from_nanos(io_nanos as u64));
+        }
         if let Some(file_path) = &self.2 {
             if let Err(e) = fs::remove_file(file_path) {
                 warn!("Was unable to delete spill file: {file_path}. error: {e}");
@@ -300,6 +314,25 @@ impl<W: Write> Write for IoTimeWriteWrapper<W> {
 pub struct OwnedSpillBufReader<'a> {
     spill: Box<dyn Spill>,
     buf_reader: BufReader<Box<dyn Read + Send + 'a>>,
+}
+
+#[cfg(test)]
+mod file_spill_tests {
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
+    use super::*;
+
+    #[test]
+    fn empty_file_spills_do_not_recount_other_io() -> Result<()> {
+        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        metrics
+            .mem_spill_iotime
+            .add_duration(Duration::from_secs(1));
+        drop(FileSpill::try_new(&metrics)?);
+        drop(FileSpill::try_new(&metrics)?);
+        assert_eq!(metrics.disk_spill_iotime.value(), 0);
+        Ok(())
+    }
 }
 
 impl<'a> OwnedSpillBufReader<'a> {

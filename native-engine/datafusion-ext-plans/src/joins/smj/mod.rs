@@ -17,6 +17,7 @@ pub mod existence_join;
 pub mod full_join;
 pub mod group_merge;
 pub mod semi_join;
+mod spill;
 
 #[cfg(test)]
 mod tests;
