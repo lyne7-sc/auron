@@ -335,17 +335,13 @@ impl<const P: i32> SemiJoiner<P> {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl<const P: i32> Joiner for SemiJoiner<P> {
-    async fn join(
+    pub(super) async fn join_with_merger(
         mut self: Pin<&mut Self>,
         cur1: &mut StreamCursor,
         cur2: &mut StreamCursor,
+        mut merger: GroupMerger,
     ) -> Result<()> {
-        let mut merger = GroupMerger::new();
-
         while let Some(action) = merger.next(cur1, cur2).await? {
             // Note: the group slices below live inside the merger and are invalidated by
             // the next `next` / `release_batches` call
@@ -359,6 +355,12 @@ impl<const P: i32> Joiner for SemiJoiner<P> {
                     self.as_mut()
                         .emit_unmatched(cur1, cur2, R, merger.rgroup())
                         .await?
+                }
+                GroupAction::SpillRequired => {
+                    self.as_mut().flush(cur1, cur2).await?;
+                    self.output_rows += merger
+                        .join_spilled_group(cur1, cur2, &self.join_params, &self.output_sender)
+                        .await?;
                 }
                 GroupAction::Both => {
                     self.as_mut()
@@ -379,6 +381,17 @@ impl<const P: i32> Joiner for SemiJoiner<P> {
         }
         self.flush(cur1, cur2).await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<const P: i32> Joiner for SemiJoiner<P> {
+    async fn join(
+        self: Pin<&mut Self>,
+        cur1: &mut StreamCursor,
+        cur2: &mut StreamCursor,
+    ) -> Result<()> {
+        self.join_with_merger(cur1, cur2, GroupMerger::new()).await
     }
 
     fn num_output_rows(&self) -> usize {

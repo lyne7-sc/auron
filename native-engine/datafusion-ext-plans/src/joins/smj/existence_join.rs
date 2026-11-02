@@ -243,6 +243,12 @@ impl Joiner for ExistenceJoiner {
                 }
                 // The right side is never output
                 GroupAction::RightOnly => {}
+                GroupAction::SpillRequired => {
+                    self.as_mut().flush(cur1, cur2).await?;
+                    self.output_rows += merger
+                        .join_spilled_group(cur1, cur2, &self.join_params, &self.output_sender)
+                        .await?;
+                }
                 GroupAction::Both => {
                     self.as_mut()
                         .emit_matched(cur1, cur2, merger.lgroup(), merger.rgroup())

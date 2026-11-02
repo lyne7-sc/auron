@@ -67,14 +67,23 @@
 //!
 //! [`JoinFilter`]: crate::joins::join_filter::JoinFilter
 
-use std::{cmp::Ordering, collections::VecDeque};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 
+use auron_memmgr::metrics::SpillMetrics;
+use count_write::CountWrite;
 use datafusion::common::Result;
+use datafusion_ext_commons::{arrow::array_size::BatchSize, io::write_one_batch};
 
+use super::spill::SpilledGroup;
 use crate::{
+    common::execution_context::{WrappedRecordBatchSender, WrappedSenderTrait},
     cur_forward,
-    joins::{Idx, IdxRange, stream_cursor::StreamCursor},
+    joins::{Idx, IdxRange, JoinParams, stream_cursor::StreamCursor},
 };
+
+// Bound the data and encoded keys retained by one merge, apart from the
+// current input batches. Oversized groups use bounded, replayable chunks.
+const GROUP_MEMORY_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Buffered, not-yet-emitted rows on one side.
 #[derive(Default)]
@@ -82,10 +91,71 @@ struct GroupedSide {
     /// Pending rows in stream order; `segs[0].start` is the first unconsumed
     /// row. No segment is ever empty.
     segs: VecDeque<IdxRange>,
+    /// Data bytes per row, aligned with `segs`; computed once per input batch.
+    row_sizes: VecDeque<usize>,
     num_rows: usize,
 }
 
 impl GroupedSide {
+    /// Estimate only this group's rows. A large current/lookahead batch may
+    /// contain many tiny groups; its full allocation must not force all of
+    /// them through disk.
+    fn prefix_mem_size(&self, mut rows: usize, key_size: usize) -> usize {
+        let mut size = 0usize;
+        for (seg, &row_size) in self.segs.iter().zip(&self.row_sizes) {
+            let taken = rows.min(seg.len());
+            size = size.saturating_add(row_size.saturating_add(key_size).saturating_mul(taken));
+            rows -= taken;
+            if rows == 0 {
+                break;
+            }
+        }
+        size
+    }
+
+    async fn spill(
+        &mut self,
+        cur: &mut StreamCursor,
+        key: &[u8],
+        chunk_rows: usize,
+        metrics: &SpillMetrics,
+    ) -> Result<SpilledGroup> {
+        let mut group = SpilledGroup::new(cur.batch_schema.clone(), metrics)?;
+        let mut writer = group.data.get_compressed_writer();
+        let mut ranges = vec![];
+        loop {
+            if self.is_empty() {
+                if cur.finished() {
+                    break;
+                }
+                self.fill_one_batch(cur).await?;
+            }
+            if cur.key(self.head()).data() != key {
+                break;
+            }
+            let n = self.count_while(|idx| cur.key(idx).data() == key);
+            self.take(n, &mut ranges);
+            for range in &ranges {
+                let batch = &cur.batches()[range.batch_idx];
+                let bytes_per_row = (batch.get_batch_mem_size() / batch.num_rows()).max(1);
+                let step = chunk_rows.max(1).min((1024 * 1024 / bytes_per_row).max(1));
+                for start in (range.start..range.end).step_by(step) {
+                    let batch = batch.slice(start, step.min(range.end - start));
+                    let mut counted = CountWrite::from(&mut writer);
+                    write_one_batch(batch.num_rows(), batch.columns(), &mut counted)?;
+                    group.num_rows += batch.num_rows();
+                    metrics.mem_spill_size.add(counted.count() as usize);
+                    tokio::task::yield_now().await;
+                }
+            }
+            ranges.clear();
+            let shift = cur.clean_batches_before(self.min_referenced_batch(cur));
+            self.rebase(shift);
+        }
+        writer.finish()?;
+        Ok(group)
+    }
+
     #[inline]
     fn is_empty(&self) -> bool {
         self.num_rows == 0
@@ -159,6 +229,8 @@ impl GroupedSide {
         debug_assert!(!cur.finished());
         let (batch_idx, start) = cur.cur_idx();
         let end = cur.cur_batch_num_rows();
+        self.row_sizes
+            .push_back(cur.batches()[batch_idx].get_batch_mem_size().div_ceil(end));
         self.segs.push_back(IdxRange {
             batch_idx,
             start,
@@ -188,6 +260,7 @@ impl GroupedSide {
             seg.start += taken;
             if seg.is_empty() {
                 self.segs.pop_front();
+                self.row_sizes.pop_front();
             }
             left -= taken;
         }
@@ -216,23 +289,44 @@ impl GroupedSide {
 pub enum GroupAction {
     /// Two runs of equal, non-null keys.
     Both,
+    /// Flush pending output before collecting and releasing this hot group.
+    SpillRequired,
     /// Left rows that no right row can match; not necessarily a single group.
     LeftOnly,
     /// Right rows that no left row can match; not necessarily a single group.
     RightOnly,
 }
 
-#[derive(Default)]
 pub struct GroupMerger {
     l: GroupedSide,
     r: GroupedSide,
     lgroup: Vec<IdxRange>,
     rgroup: Vec<IdxRange>,
+    memory_limit: usize,
+}
+
+impl Default for GroupMerger {
+    fn default() -> Self {
+        Self {
+            l: GroupedSide::default(),
+            r: GroupedSide::default(),
+            lgroup: vec![],
+            rgroup: vec![],
+            memory_limit: GROUP_MEMORY_LIMIT,
+        }
+    }
 }
 
 impl GroupMerger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn with_memory_limit(memory_limit: usize) -> Self {
+        Self {
+            memory_limit,
+            ..Self::default()
+        }
     }
 
     /// Rows covered by the last [`GroupAction::LeftOnly`] or
@@ -311,11 +405,22 @@ impl GroupMerger {
                             // A run that reached the end of the buffer may
                             // still continue in a not-yet-read batch.
                             let ln = self.l.count_while(|idx| lcur.key(idx) == lkey);
+                            let rn = self.r.count_while(|idx| rcur.key(idx) == rkey);
+                            // Every row in this prefix has the same encoded key. Include
+                            // its bytes, the row offset, and null metadata in the estimate.
+                            let key_size = lkey.data().len() + size_of::<usize>() + 1;
+                            if self
+                                .l
+                                .prefix_mem_size(ln, key_size)
+                                .saturating_add(self.r.prefix_mem_size(rn, key_size))
+                                >= self.memory_limit
+                            {
+                                return Ok(Some(GroupAction::SpillRequired));
+                            }
                             if ln == self.l.num_rows && !lcur.finished() {
                                 self.l.fill_one_batch(lcur).await?;
                                 continue;
                             }
-                            let rn = self.r.count_while(|idx| rcur.key(idx) == rkey);
                             if rn == self.r.num_rows && !rcur.finished() {
                                 self.r.fill_one_batch(rcur).await?;
                                 continue;
@@ -328,6 +433,43 @@ impl GroupMerger {
                 }
             }
         }
+    }
+
+    /// The caller must first flush every output index and pending predicate
+    /// referring to the cursors. Collection releases data and key rows as it
+    /// progresses, leaving the following key available to the normal merge.
+    pub(super) async fn spill_group(
+        &mut self,
+        lcur: &mut StreamCursor,
+        rcur: &mut StreamCursor,
+        chunk_rows: usize,
+        metrics: &SpillMetrics,
+    ) -> Result<(SpilledGroup, SpilledGroup)> {
+        let key = lcur.key(self.l.head()).data().to_vec();
+        self.lgroup.clear();
+        self.rgroup.clear();
+        let left = self.l.spill(lcur, &key, chunk_rows, metrics).await?;
+        let right = self.r.spill(rcur, &key, chunk_rows, metrics).await?;
+        Ok((left, right))
+    }
+
+    /// Flush pending output before calling: collecting the group releases cursor batches.
+    pub(super) async fn join_spilled_group(
+        &mut self,
+        lcur: &mut StreamCursor,
+        rcur: &mut StreamCursor,
+        params: &JoinParams,
+        sender: &Arc<WrappedRecordBatchSender>,
+    ) -> Result<usize> {
+        let (left, right) = self
+            .spill_group(
+                lcur,
+                rcur,
+                params.batch_size,
+                sender.exec_ctx().spill_metrics(),
+            )
+            .await?;
+        super::spill::join_spilled_group(left, right, params, sender).await
     }
 
     /// Releases batches no longer referenced by either side.
@@ -414,6 +556,105 @@ mod tests {
             .expect("valid test cursor")
     }
 
+    #[tokio::test]
+    async fn small_groups_in_a_large_input_batch_do_not_spill() -> Result<()> {
+        let values = (0..128).map(Some).collect::<Vec<_>>();
+        let (mut lc, mut rc) = (cursor(vec![values.clone()]), cursor(vec![values]));
+        cur_forward!(lc);
+        cur_forward!(rc);
+        let mut merger = GroupMerger::with_memory_limit(128);
+        assert!(lc.batches()[1].get_batch_mem_size() > 128);
+        let mut groups = 0;
+        while let Some(action) = merger.next(&mut lc, &mut rc).await? {
+            assert_eq!(action, GroupAction::Both);
+            groups += 1;
+            merger.release_batches(&mut lc, &mut rc);
+        }
+        assert_eq!(groups, 128);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_group_stops_buffering_before_reading_the_whole_group() -> Result<()> {
+        let (mut lcur, mut rcur) = (
+            cursor(vec![vec![Some(1); 16_384]; 128]),
+            cursor(vec![vec![Some(1)]]),
+        );
+        cur_forward!(lcur);
+        cur_forward!(rcur);
+        let mut merger = GroupMerger::new();
+        assert!(merger.next(&mut lcur, &mut rcur).await?.is_some());
+        assert!(
+            lcur.num_buffered_batches() <= 64,
+            "buffered {} input batches before returning control to the joiner",
+            lcur.num_buffered_batches()
+        );
+        let metrics = SpillMetrics::new(
+            &datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new(),
+            0,
+        );
+        let (left, right) = merger
+            .spill_group(&mut lcur, &mut rcur, 8192, &metrics)
+            .await?;
+        assert_eq!((left.num_rows, right.num_rows), (128 * 16_384, 1));
+        assert_eq!(
+            (lcur.num_buffered_batches(), rcur.num_buffered_batches()),
+            (0, 0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consecutive_spilled_groups_keep_nulls_and_following_keys() -> Result<()> {
+        for batch_size in [1, 3, 8] {
+            let left = [
+                vec![None, Some(1)],
+                vec![Some(2); 8],
+                vec![Some(3); 9],
+                vec![Some(4)],
+            ]
+            .concat();
+            let right = [
+                vec![None, Some(1)],
+                vec![Some(2); 7],
+                vec![Some(3); 8],
+                vec![Some(5)],
+            ]
+            .concat();
+            let mut lc = cursor(left.chunks(batch_size).map(|c| c.to_vec()).collect());
+            let mut rc = cursor(right.chunks(batch_size).map(|c| c.to_vec()).collect());
+            cur_forward!(lc);
+            cur_forward!(rc);
+            let mut merger = GroupMerger::with_memory_limit(1);
+            let metrics = SpillMetrics::new(
+                &datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new(),
+                0,
+            );
+            let mut groups = vec![];
+            let mut unmatched = (0, 0);
+            while let Some(action) = merger.next(&mut lc, &mut rc).await? {
+                match action {
+                    GroupAction::SpillRequired => {
+                        let (l, r) = merger.spill_group(&mut lc, &mut rc, 2, &metrics).await?;
+                        groups.push((l.num_rows, r.num_rows));
+                        assert!(lc.num_buffered_batches() <= 2 && rc.num_buffered_batches() <= 2);
+                    }
+                    GroupAction::LeftOnly => unmatched.0 += ranges_iter(merger.lgroup()).count(),
+                    GroupAction::RightOnly => unmatched.1 += ranges_iter(merger.rgroup()).count(),
+                    GroupAction::Both => unreachable!("all matching groups exceed the test limit"),
+                }
+                merger.release_batches(&mut lc, &mut rc);
+            }
+            assert_eq!(groups, vec![(1, 1), (8, 7), (9, 8)]);
+            assert_eq!(unmatched, (2, 2));
+            assert_eq!(
+                (lc.num_buffered_batches(), rc.num_buffered_batches()),
+                (0, 0)
+            );
+        }
+        Ok(())
+    }
+
     /// Runs the merge to completion, describing each action by the key values
     /// it covers.
     async fn actions(
@@ -456,6 +697,7 @@ mod tests {
             out.push(match action {
                 GroupAction::LeftOnly => format!("L[{}]", describe(&lcur, merger.lgroup())),
                 GroupAction::RightOnly => format!("R[{}]", describe(&rcur, merger.rgroup())),
+                GroupAction::SpillRequired => unreachable!("small test groups must not spill"),
                 GroupAction::Both => format!(
                     "B[{}|{}]",
                     describe(&lcur, merger.lgroup()),

@@ -44,6 +44,7 @@ use crate::{
         join_utils::JoinType,
         smj::{
             full_join::{LeftOuterJoiner, RightOuterJoiner},
+            group_merge::GroupMerger,
             semi_join::{LeftAntiJoiner, RightAntiJoiner},
         },
         stream_cursor::StreamCursor,
@@ -65,7 +66,7 @@ fn batch(prefix: &str, keys: &[i32], values: &[i32]) -> RecordBatch {
     .expect("valid test batch")
 }
 
-fn cursor(batch: RecordBatch, input_batch_size: usize, read: &[usize]) -> StreamCursor {
+pub(super) fn cursor(batch: RecordBatch, input_batch_size: usize, read: &[usize]) -> StreamCursor {
     let schema = batch.schema();
     let converter = Arc::new(parking_lot::Mutex::new(
         RowConverter::new(vec![SortField::new(DataType::Int32)]).expect("valid test sort fields"),
@@ -105,6 +106,7 @@ async fn run(
     join_type: JoinType,
     batch_size: usize,
     input_batch_size: usize,
+    memory_limit: usize,
 ) -> Result<Vec<RecordBatch>> {
     let is_right = matches!(join_type, JoinType::Right | JoinType::RightAnti);
     let is_anti = matches!(join_type, JoinType::LeftAnti | JoinType::RightAnti);
@@ -171,21 +173,28 @@ async fn run(
         }
         batches
     });
-    let mut joiner: Pin<Box<dyn Joiner>> = match join_type {
-        JoinType::Left => Box::pin(LeftOuterJoiner::new(params, sender)),
-        JoinType::Right => Box::pin(RightOuterJoiner::new(params, sender)),
-        JoinType::LeftAnti => Box::pin(LeftAntiJoiner::new(params, sender)),
-        JoinType::RightAnti => Box::pin(RightAntiJoiner::new(params, sender)),
-        _ => unreachable!(),
-    };
     let (mut lcur, mut rcur) = (
         cursor(left, input_batch_size, &lread),
         cursor(right, input_batch_size, &rread),
     );
     cur_forward!(lcur);
     cur_forward!(rcur);
-    joiner.as_mut().join(&mut lcur, &mut rcur).await?;
-    drop(joiner);
+    let merger = GroupMerger::with_memory_limit(memory_limit);
+    macro_rules! join {
+        ($joiner:ty) => {
+            Box::pin(<$joiner>::new(params, sender))
+                .as_mut()
+                .join_with_merger(&mut lcur, &mut rcur, merger)
+                .await?
+        };
+    }
+    match join_type {
+        JoinType::Left => join!(LeftOuterJoiner),
+        JoinType::Right => join!(RightOuterJoiner),
+        JoinType::LeftAnti => join!(LeftAntiJoiner),
+        JoinType::RightAnti => join!(RightAntiJoiner),
+        _ => unreachable!(),
+    }
     Ok(collector.await.expect("test collector completes"))
 }
 
@@ -205,6 +214,7 @@ async fn test_filtered_outer_and_anti_preserve_key_order() -> Result<()> {
                     join_type,
                     batch_size,
                     input_batch_size,
+                    usize::MAX,
                 )
                 .await?;
                 let key_column = if join_type == JoinType::Right { 2 } else { 0 };
@@ -254,6 +264,7 @@ async fn test_outer_order_survives_mid_group_output_flush() -> Result<()> {
                 join_type,
                 4,
                 input_batch_size,
+                usize::MAX,
             )
             .await?;
             let key_column = if join_type == JoinType::Right { 2 } else { 0 };
@@ -547,6 +558,44 @@ async fn test_compact_residual_filter_all_join_types_and_projections() -> Result
                 assert_eq!(
                     actual, expected,
                     "join_type={join_type:?}, empty_projection={empty_projection}, input_batch_size={input_batch_size}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn spilled_outer_and_anti_keep_group_order() -> Result<()> {
+    let own_keys = [vec![1], vec![2; 20], vec![3; 11], vec![4]].concat();
+    let own_values = [vec![0], vec![20; 31], vec![0]].concat();
+    let other_keys = [vec![1], vec![2; 7], vec![3; 9], vec![5]].concat();
+    for jt in [
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+    ] {
+        for input_batch_size in [3, 1024] {
+            let own = batch("own", &own_keys, &own_values);
+            let other = batch("other", &other_keys, &vec![10; other_keys.len()]);
+            let expected = run(
+                own.clone(),
+                other.clone(),
+                jt,
+                4,
+                input_batch_size,
+                usize::MAX,
+            )
+            .await?;
+            let expected = arrow::compute::concat_batches(&expected[0].schema(), &expected)?;
+            for limit in [1, 2048] {
+                let actual =
+                    run(own.clone(), other.clone(), jt, 4, input_batch_size, limit).await?;
+                let actual = arrow::compute::concat_batches(&expected.schema(), &actual)?;
+                assert_eq!(
+                    actual, expected,
+                    "{jt:?}, input_batch_size={input_batch_size}, limit={limit}"
                 );
             }
         }
