@@ -730,7 +730,29 @@ impl ExternalSorter {
         // add to in-mem blocks
         let mut block_builder = InMemSortedBlockBuilder::default();
         block_builder.add_batch_and_keys(sorted_batch, key_collector)?;
-        self.in_mem_blocks.lock().push(block_builder.finish()?);
+        {
+            let mut blocks = self.in_mem_blocks.lock();
+            blocks.push(block_builder.finish()?);
+
+            // Periodically discard losing Top-N candidates instead of retaining
+            // up to `limit` rows per input batch. Wait until merging can remove
+            // at least half the rows so large limits don't cause needless work.
+            if self.limit != usize::MAX && blocks.len() >= NUM_MAX_MERGING_BATCHES {
+                let num_rows: usize = blocks
+                    .iter()
+                    .flat_map(|block| &block.sorted_batches)
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                if num_rows > self.limit.saturating_mul(2) {
+                    let merged = merge_blocks::<_, InMemRowsKeyCollector>(
+                        self.clone(),
+                        std::mem::take(&mut *blocks),
+                        InMemSortedBlockBuilder::default(),
+                    )?;
+                    blocks.push(merged);
+                }
+            }
+        }
 
         let mem_used = self.mem_used();
         self.update_mem_used(mem_used).await?;
@@ -1576,10 +1598,296 @@ mod test {
         physical_plan::{ExecutionPlan, common, test::TestMemoryExec},
         prelude::SessionContext,
     };
-    use futures::TryStreamExt;
+    use futures::{StreamExt, TryStreamExt};
 
     use super::common_prefix_len;
     use crate::sort_exec::SortExec;
+
+    #[tokio::test]
+    async fn test_topn_compacts_candidates_across_batches() -> Result<()> {
+        use arrow::{array::AsArray, compute::concat_batches};
+        use auron_memmgr::MemConsumer;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
+        use crate::common::execution_context::ExecutionContext;
+
+        MemManager::init(1_000_000_000);
+        let limit = 17;
+        let offset = 5;
+        let input = build_table(("a", &vec![0]), ("b", &vec![0]), ("c", &vec![0]))?;
+        let sort = SortExec::new(
+            input,
+            vec![PhysicalSortExpr::new(
+                Arc::new(Column::new("a", 0)),
+                SortOptions::default(),
+            )],
+            Some(limit),
+            offset,
+        );
+        let ctx = ExecutionContext::new(
+            SessionContext::new().task_ctx(),
+            0,
+            sort.schema(),
+            &ExecutionPlanMetricsSet::new(),
+        );
+        let sorter = sort.init_sorter(ctx.clone(), &[0, 1, 2])?;
+        // Keep this retention check independent of the process-wide test memory budget.
+        sorter.set_spillable(false);
+        for batch_idx in (0..129).rev() {
+            let keys = (batch_idx * 64..(batch_idx + 1) * 64)
+                .rev()
+                .collect::<Vec<i32>>();
+            sorter
+                .insert_batch(build_table_i32(("a", &keys), ("b", &keys), ("c", &keys))?)
+                .await?;
+        }
+        let retained_rows: usize = sorter
+            .in_mem_blocks
+            .lock()
+            .iter()
+            .flat_map(|block| &block.sorted_batches)
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert!(
+            retained_rows <= 32 * limit,
+            "Top-N retained {retained_rows} rows for limit={limit}"
+        );
+        let output = ctx.output_with_sender("TestTopN", move |sender| async move {
+            sorter.output(sender).await
+        });
+        let result = concat_batches(&sort.schema(), &common::collect(output).await?)?;
+        assert_eq!(result.num_rows(), limit - offset);
+        for col in result.columns() {
+            assert_eq!(
+                col.as_primitive::<arrow::datatypes::Int32Type>()
+                    .values()
+                    .as_ref(),
+                &(offset as i32..limit as i32).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_topn_compaction_with_projection_and_spill() -> Result<()> {
+        use arrow::{
+            array::{ArrayRef, StringArray},
+            compute::{SortColumn, concat_batches, lexsort_to_indices},
+            row::{RowConverter, SortField},
+        };
+        use auron_memmgr::MemConsumer;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
+        use crate::common::execution_context::ExecutionContext;
+
+        MemManager::init(1_000_000_000);
+        let batches = (0..65)
+            .map(|b| {
+                let ids = (b * 1024..(b + 1) * 1024).rev().collect::<Vec<i32>>();
+                let keys: StringArray = ids
+                    .iter()
+                    .map(|id| (id % 17 != 0).then(|| format!("{:03}", id % 97)))
+                    .collect();
+                RecordBatch::try_from_iter(vec![
+                    ("key", Arc::new(keys) as ArrayRef),
+                    ("id", Arc::new(Int32Array::from(ids))),
+                    (
+                        "payload",
+                        Arc::new(StringArray::from(vec!["x".repeat(128); 1024])),
+                    ),
+                ])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batches[0].schema();
+        let all = concat_batches(&schema, &batches)?;
+        let limit = 12000;
+        let offset = 13;
+        for descending in [false, true] {
+            let options = SortOptions {
+                descending,
+                nulls_first: !descending,
+            };
+            let sort_exprs = vec![
+                PhysicalSortExpr::new(Arc::new(Column::new("key", 0)), options),
+                PhysicalSortExpr::new(Arc::new(Column::new("id", 1)), SortOptions::default()),
+            ];
+            let indices = lexsort_to_indices(
+                &[
+                    SortColumn {
+                        values: all.column(0).clone(),
+                        options: Some(options),
+                    },
+                    SortColumn {
+                        values: all.column(1).clone(),
+                        options: Some(SortOptions::default()),
+                    },
+                ],
+                Some(limit),
+            )?;
+            let expected = datafusion_ext_commons::arrow::selection::take_batch(
+                all.clone(),
+                indices.values().to_vec(),
+            )?
+            .slice(offset, limit - offset);
+            let converter = RowConverter::new(vec![
+                SortField::new_with_options(DataType::Utf8, options),
+                SortField::new(DataType::Int32),
+            ])?;
+            let expected_keys = converter.convert_columns(&expected.columns()[..2])?;
+            for force_spill in [false, true] {
+                for projection in [vec![], vec![1, 2], vec![0, 1, 2]] {
+                    let input = Arc::new(TestMemoryExec::try_new(
+                        &[batches.clone()],
+                        schema.clone(),
+                        None,
+                    )?);
+                    let sort = SortExec::new(input, sort_exprs.clone(), Some(limit), offset);
+                    let output_schema = Arc::new(schema.project(&projection)?);
+                    let ctx = ExecutionContext::new(
+                        SessionContext::new().task_ctx(),
+                        0,
+                        output_schema.clone(),
+                        &ExecutionPlanMetricsSet::new(),
+                    );
+                    let sorter = sort.init_sorter(ctx.clone(), &projection)?;
+                    sorter.set_spillable(false);
+                    for (batch_idx, batch) in batches.iter().enumerate() {
+                        sorter.insert_batch(batch.clone()).await?;
+                        if batch_idx == 31 {
+                            assert_eq!(
+                                sorter.in_mem_blocks.lock().len(),
+                                1,
+                                "compaction must run before testing spill and projection"
+                            );
+                            assert!(
+                                sorter.in_mem_blocks.lock()[0].sorted_batches.len() > 1,
+                                "exercise a compacted block with multiple batches"
+                            );
+                        }
+                        if force_spill && batch_idx == 40 {
+                            sorter.spill().await?;
+                        }
+                    }
+                    let mut output = ctx.output_with_sender_with_key_rows(
+                        "TestTopN",
+                        &sort_exprs,
+                        move |sender| async move { sorter.output(sender).await },
+                    );
+                    let mut result_batches = vec![];
+                    let mut row_idx = 0;
+                    while let Some(batch) = output.next().await.transpose()? {
+                        for row in batch.key_rows.iter() {
+                            assert_eq!(row.as_ref(), expected_keys.row(row_idx).as_ref());
+                            row_idx += 1;
+                        }
+                        result_batches.push(batch.batch);
+                    }
+                    assert_eq!(row_idx, limit - offset);
+                    assert_eq!(
+                        concat_batches(&output_schema, &result_batches)?,
+                        expected.project(&projection)?
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn bench_topn_many_batches() -> Result<()> {
+        use arrow::{
+            array::{ArrayRef, AsArray, StringArray},
+            compute::concat_batches,
+        };
+        use auron_memmgr::MemConsumer;
+        use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+
+        use crate::common::execution_context::ExecutionContext;
+
+        MemManager::init(1_000_000_000);
+        let batches = (0..128)
+            .map(|b| {
+                let keys = (0..8192)
+                    .map(|r| (((b * 8192 + r) as u64 * 48271) % 2147483647) as i32)
+                    .collect::<Vec<_>>();
+                RecordBatch::try_from_iter(vec![
+                    ("key", Arc::new(Int32Array::from(keys)) as ArrayRef),
+                    (
+                        "payload",
+                        Arc::new(StringArray::from(vec!["x".repeat(256); 8192])),
+                    ),
+                ])
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batches[0].schema();
+        let mut expected_keys = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_primitive::<arrow::datatypes::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        expected_keys.sort_unstable();
+        for limit in [Some(100), Some(10000), Some(1_000_000), None] {
+            for round in 0..3 {
+                let input = Arc::new(TestMemoryExec::try_new(
+                    &[batches.clone()],
+                    schema.clone(),
+                    None,
+                )?);
+                let sort = SortExec::new(
+                    input,
+                    vec![PhysicalSortExpr::new(
+                        Arc::new(Column::new("key", 0)),
+                        SortOptions::default(),
+                    )],
+                    limit,
+                    0,
+                );
+                let ctx = ExecutionContext::new(
+                    SessionContext::new().task_ctx(),
+                    0,
+                    schema.clone(),
+                    &ExecutionPlanMetricsSet::new(),
+                );
+                let sorter = sort.init_sorter(ctx.clone(), &[0, 1])?;
+                sorter.set_spillable(false);
+                let start = std::time::Instant::now();
+                let mut peak_retained = 0;
+                for batch in &batches {
+                    sorter.insert_batch(batch.clone()).await?;
+                    peak_retained = peak_retained.max(sorter.mem_used());
+                }
+                let retained = sorter.mem_used();
+                let output = ctx.output_with_sender("BenchTopN", move |sender| async move {
+                    sorter.output(sender).await
+                });
+                let result_batches = common::collect(output).await?;
+                let elapsed = start.elapsed();
+                let result = concat_batches(&schema, &result_batches)?;
+                let expected_rows = limit
+                    .unwrap_or(expected_keys.len())
+                    .min(expected_keys.len());
+                assert_eq!(result.num_rows(), expected_rows);
+                assert_eq!(
+                    result
+                        .column(0)
+                        .as_primitive::<arrow::datatypes::Int32Type>()
+                        .values()
+                        .as_ref(),
+                    &expected_keys[..expected_rows]
+                );
+                eprintln!(
+                    "topn_many_batches limit={limit:?} round={round} elapsed={elapsed:?} peak_retained={peak_retained} final_retained={retained}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     fn build_table_i32(
         a: (&str, &Vec<i32>),
