@@ -1098,8 +1098,12 @@ object NativeConverters extends Logging {
         buildExtScalarFunction("Spark_StringConcatWs", e.children, e.dataType)
 
       case e: Coalesce =>
+        // Scalar functions eagerly evaluate their arguments; CASE short-circuits per row.
         val children = e.children.map(Cast(_, e.dataType))
-        buildScalarFunction(pb.ScalarFunction.Coalesce, children, e.dataType)
+        val caseWhen = children.init.foldRight[Expression](children.last) { (cond, elseExpr) =>
+          CaseWhen(Seq((IsNotNull(cond), cond)), Some(elseExpr))
+        }
+        convertExprWithFallback(caseWhen, isPruningExpr, fallback)
 
       case _ @StringLPad(str, len, pad) =>
         buildScalarFunction(

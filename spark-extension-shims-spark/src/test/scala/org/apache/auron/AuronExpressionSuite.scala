@@ -20,6 +20,24 @@ import org.apache.spark.sql.AuronQueryTest
 
 class AuronExpressionSuite extends AuronQueryTest with BaseAuronSQLSuite {
 
+  test("Coalesce short-circuits unused arguments") {
+    withSQLConf("spark.sql.ansi.enabled" -> "true") {
+      withTable("coalesce_short_circuit") {
+        sql("CREATE TABLE coalesce_short_circuit(d DATE, m INT) USING parquet")
+        sql("""INSERT INTO coalesce_short_circuit VALUES
+              |(DATE '1970-01-01', 13), (NULL, 1), (NULL, NULL)
+              |""".stripMargin)
+        checkSparkAnswerAndOperator(
+          "SELECT coalesce(d, make_date(2024, m, 1)) FROM coalesce_short_circuit")
+        checkSparkAnswerAndOperator(
+          "SELECT coalesce(d, make_date(2024, m, 1)) FROM coalesce_short_circuit WHERE m = 13")
+        checkSparkAnswerAndOperator(
+          """SELECT coalesce(d, make_date(2024, m, 1), DATE '2025-01-01')
+            |FROM coalesce_short_circuit""".stripMargin)
+      }
+    }
+  }
+
   test("preserve literal parameters during expression fallback") {
     withSQLConf(
       "spark.auron.decimal.arithOp.enabled" -> "false",
