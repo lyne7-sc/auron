@@ -157,6 +157,46 @@ fn assert_metrics(metrics: &ParquetFileMetrics, pruned: usize, matched: usize, e
 }
 
 #[tokio::test]
+async fn dictionary_pruning_uses_exact_physical_column() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("ID", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 15, 30, 10, 15, 30])),
+            Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50, 60])),
+        ],
+    )?;
+    let properties = WriterProperties::builder()
+        .set_max_row_group_size(3)
+        .set_dictionary_enabled(true)
+        .build();
+    let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties))?;
+    writer.write(&batch)?;
+    let reader = TestReader::new(Bytes::from(writer.into_inner()?));
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+    let metrics = ParquetFileMetrics::new(0, "case_sensitive", &ExecutionPlanMetricsSet::new());
+
+    for (value, expected) in [(20, vec![0]), (15, vec![])] {
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("ID", 1)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(value)))),
+        ));
+        let kept = prune(
+            &mut builder,
+            predicate,
+            ParquetAccessPlan::new_all(2),
+            &metrics,
+        )?;
+        assert_eq!(kept, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn decimal_statistics_metrics() -> Result<()> {
     let data = write_parquet(
         Arc::new(Decimal128Array::from(vec![-100, 0, 500, 1000]).with_precision_and_scale(18, 2)?),

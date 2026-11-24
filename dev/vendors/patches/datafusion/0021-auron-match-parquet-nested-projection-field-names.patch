@@ -1,0 +1,180 @@
+diff --git a/datafusion/datasource-parquet/src/nested_schema_pruning.rs b/datafusion/datasource-parquet/src/nested_schema_pruning.rs
+index 9768282c3bab..d239d0cd2573 100644
+--- a/datafusion/datasource-parquet/src/nested_schema_pruning.rs
++++ b/datafusion/datasource-parquet/src/nested_schema_pruning.rs
+@@ -73,6 +73,7 @@
+ //! choice (safe, since the worst case is still just a full read) left as a
+ //! candidate follow-up rather than something this module currently handles.
+
++use std::borrow::Cow;
+ use std::collections::HashMap;
+ use std::sync::Arc;
+
+@@ -110,6 +111,14 @@
+     physical: &DataType,
+     cast_target: &DataType,
+ ) -> Option<(Vec<usize>, DataType)> {
++    clip_for_cast_with_name_matching(physical, cast_target, false)
++}
++
++pub(crate) fn clip_for_cast_with_name_matching(
++    physical: &DataType,
++    cast_target: &DataType,
++    ignore_case: bool,
++) -> Option<(Vec<usize>, DataType)> {
+     let total = count_leaves(physical);
+     let mut kept = Vec::new();
+     let mut next_leaf = 0;
+@@ -120,6 +129,7 @@
+         &mut next_leaf,
+         &mut kept,
+         &mut unclippable,
++        ignore_case,
+     );
+     debug_assert_eq!(next_leaf, total, "leaf accounting must cover the type");
+     if unclippable || kept.is_empty() || kept.len() >= total {
+@@ -153,15 +163,30 @@
+ /// threshold is worth the branch).
+ const LINEAR_FIELD_SCAN_MAX: usize = 8;
+
++fn field_name_key(name: &str, ignore_case: bool) -> Cow<'_, str> {
++    if ignore_case {
++        Cow::Owned(name.to_lowercase())
++    } else {
++        Cow::Borrowed(name)
++    }
++}
++
+ /// Find `name` among `fields`, using `by_name` when it was worth building.
+ /// Duplicate names resolve to the first occurrence either way.
+ fn lookup_field<'a>(
+     fields: &'a Fields,
+-    by_name: &Option<HashMap<&'a str, &'a FieldRef>>,
++    by_name: &Option<HashMap<Cow<'a, str>, &'a FieldRef>>,
+     name: &str,
++    ignore_case: bool,
+ ) -> Option<&'a FieldRef> {
+     match by_name {
+-        Some(map) => map.get(name).copied(),
++        Some(map) => map.get(field_name_key(name, ignore_case).as_ref()).copied(),
++        None if ignore_case => fields.iter().find(|f| {
++            let field_name = f.name();
++            field_name.eq_ignore_ascii_case(name)
++                || (!(field_name.is_ascii() && name.is_ascii())
++                    && field_name.to_lowercase() == name.to_lowercase())
++        }),
+         None => fields.iter().find(|f| f.name() == name),
+     }
+ }
+@@ -179,20 +204,24 @@
+     next_leaf: &mut usize,
+     kept: &mut Vec<usize>,
+     unclippable: &mut bool,
++    ignore_case: bool,
+ ) -> DataType {
+     match (physical, target) {
+         (DataType::Struct(p_children), DataType::Struct(t_children)) => {
+             let t_by_name = (t_children.len() > LINEAR_FIELD_SCAN_MAX).then(|| {
+                 let mut map = HashMap::with_capacity(t_children.len());
+                 for tc in t_children.iter() {
+-                    map.entry(tc.name().as_str()).or_insert(tc);
++                    map.entry(field_name_key(tc.name(), ignore_case))
++                        .or_insert(tc);
+                 }
+                 map
+             });
+             let kept_children: Fields = p_children
+                 .iter()
+                 .filter_map(|pc| {
+-                    let Some(tc) = lookup_field(t_children, &t_by_name, pc.name()) else {
++                    let Some(tc) =
++                        lookup_field(t_children, &t_by_name, pc.name(), ignore_case)
++                    else {
+                         skip_leaves(pc.data_type(), next_leaf);
+                         return None;
+                     };
+@@ -203,6 +232,7 @@
+                         next_leaf,
+                         kept,
+                         unclippable,
++                        ignore_case,
+                     );
+                     if kept.len() == before {
+                         // This child matched by name but kept no leaves at
+@@ -230,6 +260,7 @@
+                 next_leaf,
+                 kept,
+                 unclippable,
++                ignore_case,
+             );
+             DataType::List(field_with_type(p_item, pruned))
+         }
+@@ -240,6 +271,7 @@
+                 next_leaf,
+                 kept,
+                 unclippable,
++                ignore_case,
+             );
+             DataType::LargeList(field_with_type(p_item, pruned))
+         }
+@@ -603,6 +635,18 @@
+                     .collect()
+             )
+         );
++
++        let uppercase_target = struct_of(
++            (0..width)
++                .rev()
++                .filter(|i| i % 2 == 0)
++                .map(|i| int64(&format!("F{i}")))
++                .collect(),
++        );
++        assert_eq!(
++            clip_for_cast_with_name_matching(&physical, &uppercase_target, true),
++            Some((kept, emitted))
++        );
+     }
+
+     /// Duplicate physical field names both match the single target field and
+diff --git a/datafusion/datasource-parquet/src/opener/legacy.rs b/datafusion/datasource-parquet/src/opener/legacy.rs
+index 04553fd415fb..082f9769f550 100644
+--- a/datafusion/datasource-parquet/src/opener/legacy.rs
++++ b/datafusion/datasource-parquet/src/opener/legacy.rs
+@@ -25,7 +25,7 @@
+
+ use std::sync::Arc;
+
+-use crate::nested_schema_pruning::{clip_for_cast, count_leaves};
++use crate::nested_schema_pruning::{clip_for_cast_with_name_matching, count_leaves};
+ use crate::page_filter::PagePruningAccessPlanFilter;
+ use crate::row_group_filter::RowGroupAccessPlanFilter;
+ use crate::{
+@@ -648,7 +648,11 @@
+         }
+         let clipped = match targets[root].as_slice() {
+             [target] if count_leaves(physical.data_type()) == root_leaves.len() => {
+-                clip_for_cast(physical.data_type(), target)
++                clip_for_cast_with_name_matching(
++                    physical.data_type(),
++                    target,
++                    schema_adapter.nested_field_names_ignore_case(),
++                )
+             }
+             _ => None,
+         };
+diff --git a/datafusion/datasource/src/schema_adapter.rs b/datafusion/datasource/src/schema_adapter.rs
+index c995fa58d6c8..040cc49cb5c9 100644
+--- a/datafusion/datasource/src/schema_adapter.rs
++++ b/datafusion/datasource/src/schema_adapter.rs
+@@ -85,6 +85,11 @@
+     /// Map a column index in the table schema to a column index in a particular file schema.
+     fn map_column_index(&self, index: usize, file_schema: &Schema) -> Option<usize>;
+
++    /// Whether to compare field names case-insensitively when clipping nested projections.
++    fn nested_field_names_ignore_case(&self) -> bool {
++        false
++    }
++
+     /// Creates a mapping for casting columns from the file schema to the table schema.
+     fn map_schema(
+         &self,

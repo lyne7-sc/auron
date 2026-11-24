@@ -184,6 +184,7 @@ impl PhysicalPlanner {
                     conf,
                     scan.fs_resource_id.clone(),
                     Some(predicate),
+                    scan.case_sensitive,
                 )))
             }
             PhysicalPlanType::OrcScan(scan) => {

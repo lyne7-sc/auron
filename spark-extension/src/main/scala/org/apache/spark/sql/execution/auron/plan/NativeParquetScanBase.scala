@@ -32,6 +32,9 @@ import org.apache.auron.metric.SparkMetricNode
 abstract class NativeParquetScanBase(basedFileScan: FileSourceScanExec)
     extends NativeFileSourceScanBase(basedFileScan) {
 
+  private val caseSensitive =
+    basedFileScan.relation.sparkSession.sessionState.conf.caseSensitiveAnalysis
+
   override def doExecuteNative(): NativeRDD = {
     val partitions = inputFileScanRDD.filePartitions.toArray
     if (partitions.length > 0) {
@@ -51,7 +54,6 @@ abstract class NativeParquetScanBase(basedFileScan: FileSourceScanExec)
       val nativeFileSchema = this.nativeFileSchema
       val nativeFileGroups = this.nativeFileGroups
       val nativePartitionSchema = this.nativePartitionSchema
-
       val projection = schema.map(field => basedFileScan.relation.schema.fieldIndex(field.name))
       val broadcastedHadoopConf = this.broadcastedHadoopConf
       val numPartitions = partitions.length
@@ -82,6 +84,7 @@ abstract class NativeParquetScanBase(basedFileScan: FileSourceScanExec)
           val nativeParquetScanExecBuilder = pb.ParquetScanExecNode
             .newBuilder()
             .setBaseConf(nativeParquetScanConf)
+            .setCaseSensitive(caseSensitive)
             .setFsResourceId(resourceId)
             .addAllPruningPredicates(nativePruningPredicateFilters.asJava)
 

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{str::FromStr, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{array::*, datatypes::*};
 use bigdecimal::BigDecimal;
@@ -24,17 +24,69 @@ use num::{Bounded, FromPrimitive, Integer, Signed};
 use crate::df_execution_err;
 
 pub fn cast(array: &dyn Array, cast_type: &DataType) -> Result<ArrayRef> {
-    cast_impl(array, cast_type, false)
+    cast_impl(array, cast_type, StructFieldMatch::Position)
 }
 
-pub fn cast_scan_input_array(array: &dyn Array, cast_type: &DataType) -> Result<ArrayRef> {
-    cast_impl(array, cast_type, true)
-}
-
-pub fn cast_impl(
+pub fn cast_scan_input_array(
     array: &dyn Array,
     cast_type: &DataType,
-    match_struct_fields: bool,
+    parquet_case_sensitive: Option<bool>,
+) -> Result<ArrayRef> {
+    let field_match = match parquet_case_sensitive {
+        Some(case_sensitive) => StructFieldMatch::Parquet { case_sensitive },
+        None => StructFieldMatch::LegacyName,
+    };
+    cast_impl(array, cast_type, field_match)
+}
+
+pub fn parquet_names_eq_ignore_case(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+        || (!(left.is_ascii() && right.is_ascii()) && left.to_lowercase() == right.to_lowercase())
+}
+
+#[derive(Clone, Copy)]
+enum StructFieldMatch {
+    Position,
+    LegacyName,
+    Parquet { case_sensitive: bool },
+}
+
+fn struct_field_name_key(name: &str, ignore_case: bool) -> Cow<'_, str> {
+    if ignore_case {
+        Cow::Owned(name.to_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+fn cast_struct_by_position(
+    array: &StructArray,
+    fields: &Fields,
+    field_match: StructFieldMatch,
+) -> Result<ArrayRef> {
+    if fields.len() != array.num_columns() {
+        return df_execution_err!("cannot cast structs with different numbers of fields");
+    }
+    let children = array
+        .columns()
+        .iter()
+        .zip(fields)
+        .map(|(column, field)| Ok(cast_impl(column, field.data_type(), field_match)?.into_data()))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(make_array(
+        array
+            .to_data()
+            .into_builder()
+            .data_type(DataType::Struct(fields.clone()))
+            .child_data(children)
+            .build()?,
+    ))
+}
+
+fn cast_impl(
+    array: &dyn Array,
+    cast_type: &DataType,
+    field_match: StructFieldMatch,
 ) -> Result<ArrayRef> {
     Ok(match (&array.data_type(), cast_type) {
         (&t1, t2) if t1 == t2 => make_array(array.to_data()),
@@ -114,7 +166,7 @@ pub fn cast_impl(
         }
         (&DataType::List(_), DataType::List(to_field)) => {
             let list = as_list_array(array);
-            let items = cast_impl(list.values(), to_field.data_type(), match_struct_fields)?;
+            let items = cast_impl(list.values(), to_field.data_type(), field_match)?;
             make_array(
                 list.to_data()
                     .into_builder()
@@ -123,95 +175,81 @@ pub fn cast_impl(
                     .build()?,
             )
         }
-        (&DataType::Struct(_), DataType::Struct(to_fields)) => {
+        (&DataType::Struct(from_fields), DataType::Struct(to_fields)) => {
             let struct_ = as_struct_array(array);
 
-            if !match_struct_fields {
-                if to_fields.len() != struct_.num_columns() {
-                    df_execution_err!("cannot cast structs with different numbers of fields")?;
+            if matches!(field_match, StructFieldMatch::Position) {
+                cast_struct_by_position(struct_, to_fields, field_match)?
+            } else {
+                let ignore_case = matches!(
+                    field_match,
+                    StructFieldMatch::Parquet {
+                        case_sensitive: false
+                    }
+                );
+                let mut field_indices = HashMap::with_capacity(from_fields.len());
+                for (index, field) in from_fields.iter().enumerate() {
+                    field_indices
+                        .entry(struct_field_name_key(field.name(), ignore_case))
+                        .and_modify(|index| {
+                            if ignore_case {
+                                *index = None;
+                            }
+                        })
+                        .or_insert(Some(index));
                 }
 
-                let casted_arrays = struct_
-                    .columns()
-                    .iter()
-                    .zip(to_fields)
-                    .map(|(column, to_field)| {
-                        cast_impl(column, to_field.data_type(), match_struct_fields)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                make_array(
-                    struct_
-                        .to_data()
-                        .into_builder()
-                        .data_type(DataType::Struct(to_fields.clone()))
-                        .child_data(
-                            casted_arrays
-                                .into_iter()
-                                .map(|array| array.into_data())
-                                .collect(),
-                        )
-                        .build()?,
-                )
-            } else {
-                let mut null_column_name = vec![];
-                let casted_arrays = to_fields
-                    .iter()
-                    .map(|field| {
-                        let origin = field.name().as_str();
-                        let mut col = struct_.column_by_name(origin);
-                        // correct orc map entries field name from "keys" to "key", "values" to
-                        // "value"
-                        if col.is_none() && (origin.eq("key") || origin.eq("value")) {
-                            let adjust = format!("{origin}s");
-                            col = struct_.column_by_name(adjust.as_str());
+                let mut casted_fields = Vec::with_capacity(to_fields.len());
+                let mut children = Vec::with_capacity(to_fields.len());
+                for field in to_fields {
+                    let name = field.name().as_str();
+                    let index = field_indices
+                        .get(struct_field_name_key(name, ignore_case).as_ref())
+                        .or_else(|| match (field_match, name) {
+                            // ORC may name its map entries "keys" and "values".
+                            (StructFieldMatch::LegacyName, "key") => field_indices.get("keys"),
+                            (StructFieldMatch::LegacyName, "value") => field_indices.get("values"),
+                            _ => None,
+                        });
+                    let (field, child) = match index {
+                        Some(Some(index)) => (
+                            field.clone(),
+                            cast_impl(struct_.column(*index), field.data_type(), field_match)?,
+                        ),
+                        Some(None) => {
+                            return df_execution_err!(
+                                "Ambiguous Parquet struct field in case-insensitive mode: {name}"
+                            );
                         }
-                        if col.is_some() {
-                            cast_impl(
-                                col.expect("column missing"),
-                                field.data_type(),
-                                match_struct_fields,
-                            )
-                        } else {
-                            null_column_name.push(field.name().clone());
-                            Ok(new_null_array(field.data_type(), struct_.len()))
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let casted_fields = to_fields
-                    .iter()
-                    .map(|field: &FieldRef| {
-                        if null_column_name.contains(field.name()) {
-                            Arc::new(Field::new(field.name(), field.data_type().clone(), true))
-                        } else {
-                            field.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
+                        None => (
+                            Arc::new(Field::new(name, field.data_type().clone(), true)),
+                            new_null_array(field.data_type(), struct_.len()),
+                        ),
+                    };
+                    casted_fields.push(field);
+                    children.push(child.into_data());
+                }
 
                 make_array(
                     struct_
                         .to_data()
                         .into_builder()
                         .data_type(DataType::Struct(Fields::from(casted_fields)))
-                        .child_data(
-                            casted_arrays
-                                .into_iter()
-                                .map(|array| array.into_data())
-                                .collect(),
-                        )
+                        .child_data(children)
                         .build()?,
                 )
             }
         }
         (&DataType::Map(..), &DataType::Map(ref to_entries_field, to_sorted)) => {
             let map = as_map_array(array);
-            let entries = cast_impl(
-                map.entries(),
-                to_entries_field.data_type(),
-                match_struct_fields,
-            )?;
+            let entries = match (field_match, to_entries_field.data_type()) {
+                (StructFieldMatch::Parquet { .. }, DataType::Struct(fields)) => {
+                    // Parquet identifies the key and value by position, even when
+                    // the physical fields use different names.
+                    cast_struct_by_position(map.entries(), fields, field_match)?
+                }
+                _ => cast_impl(map.entries(), to_entries_field.data_type(), field_match)?,
+            };
             make_array(
                 map.to_data()
                     .into_builder()
@@ -238,7 +276,7 @@ pub fn cast_impl(
                         .map(|value| value.to_string())
                 })
                 .collect::<StringArray>();
-            cast_impl(&strings, cast_type, match_struct_fields)?
+            cast_impl(&strings, cast_type, field_match)?
         }
         // map to string (spark compatible)
         (&DataType::Map(..), &DataType::Utf8) => {
@@ -247,8 +285,8 @@ pub fn cast_impl(
             let keys = entries.column(0);
             let values = entries.column(1);
 
-            let casted_keys = cast_impl(keys, &DataType::Utf8, match_struct_fields)?;
-            let casted_values = cast_impl(values, &DataType::Utf8, match_struct_fields)?;
+            let casted_keys = cast_impl(keys, &DataType::Utf8, field_match)?;
+            let casted_values = cast_impl(values, &DataType::Utf8, field_match)?;
 
             let string_keys = as_string_array(&casted_keys);
             let string_values = as_string_array(&casted_values);
@@ -294,7 +332,7 @@ pub fn cast_impl(
             let casted_columns: Vec<ArrayRef> = struct_array
                 .columns()
                 .iter()
-                .map(|col| cast_impl(col, &DataType::Utf8, match_struct_fields))
+                .map(|col| cast_impl(col, &DataType::Utf8, field_match))
                 .collect::<Result<Vec<_>>>()?;
 
             let string_columns: Vec<&StringArray> = casted_columns
@@ -1006,6 +1044,62 @@ mod test {
             as_string_array(&casted),
             &StringArray::from_iter(vec![Some("{1 -> a}"), None, Some("{3 -> c}"),])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parquet_struct_field_names_are_case_insensitive() -> Result<()> {
+        let source = StructArray::from(
+            [("qty", 1), ("QTY", 2), ("ÉTAT", 3), ("中文", 4)]
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        Arc::new(Field::new(name, DataType::Int32, true)),
+                        Arc::new(Int32Array::from(vec![value])) as ArrayRef,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let target = DataType::Struct(Fields::from(vec![
+            Field::new("中文", DataType::Int32, true),
+            Field::new("état", DataType::Int32, true),
+            Field::new("missing", DataType::Int32, true),
+        ]));
+        let casted = cast_scan_input_array(&source, &target, Some(false))?;
+        let casted = casted.as_struct();
+        assert_eq!(casted.column(0), source.column(3));
+        assert_eq!(casted.column(1), source.column(2));
+        assert!(casted.column(2).is_null(0));
+
+        let ambiguous =
+            DataType::Struct(Fields::from(vec![Field::new("qty", DataType::Int32, true)]));
+        let error = cast_scan_input_array(&source, &ambiguous, Some(false)).unwrap_err();
+        assert!(error.to_string().contains("Ambiguous Parquet struct field"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parquet_map_entry_names_are_positional() -> Result<()> {
+        let mut physical = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        physical.keys().append_value(1);
+        physical.values().append_value("x");
+        physical.append(true)?;
+        let physical = physical.finish();
+        let target = MapBuilder::new(
+            Some(MapFieldNames {
+                key: "key".into(),
+                value: "value".into(),
+                ..Default::default()
+            }),
+            Int32Builder::new(),
+            StringBuilder::new(),
+        )
+        .finish();
+
+        let casted = cast_scan_input_array(&physical, target.data_type(), Some(false))?;
+        assert_eq!(casted.data_type(), target.data_type());
+        assert_eq!(casted.as_map().keys(), physical.keys());
+        assert_eq!(casted.as_map().values(), physical.values());
         Ok(())
     }
 

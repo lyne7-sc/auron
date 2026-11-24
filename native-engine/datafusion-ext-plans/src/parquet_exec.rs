@@ -27,15 +27,13 @@ use std::{
 };
 
 use arrow::datatypes::SchemaRef;
-use arrow_schema::Fields;
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Fields, TimeUnit};
 use auron_jni_bridge::{
     conf,
     conf::{BooleanConf, IntConf},
     jni_call_static, jni_new_global_ref, jni_new_string,
 };
 use bytes::Bytes;
-use datafusion::parquet::arrow::async_reader::AsyncFileReader;
 use datafusion::{
     datasource::{
         physical_plan::{
@@ -47,8 +45,12 @@ use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
     parquet::{
-        arrow::PARQUET_FIELD_ID_META_KEY, arrow::arrow_reader::ArrowReaderOptions,
-        errors::ParquetError, file::metadata::ParquetMetaData,
+        arrow::{
+            PARQUET_FIELD_ID_META_KEY, arrow_reader::ArrowReaderOptions,
+            async_reader::AsyncFileReader,
+        },
+        errors::ParquetError,
+        file::metadata::ParquetMetaData,
     },
     physical_expr::{EquivalenceProperties, PhysicalExprRef},
     physical_expr_adapter::PhysicalExprAdapterFactory,
@@ -85,6 +87,7 @@ pub struct ParquetExec {
     projected_schema: SchemaRef,
     metrics: ExecutionPlanMetricsSet,
     predicate: Option<PhysicalExprRef>,
+    case_sensitive: Option<bool>,
     props: OnceCell<Arc<PlanProperties>>,
 }
 
@@ -95,6 +98,7 @@ impl ParquetExec {
         base_config: FileScanConfig,
         fs_resource_id: String,
         predicate: Option<PhysicalExprRef>,
+        case_sensitive: Option<bool>,
     ) -> Self {
         let metrics = ExecutionPlanMetricsSet::new();
         let projected_schema = base_config.projected_schema().unwrap_or_else(|_| {
@@ -113,6 +117,7 @@ impl ParquetExec {
             projected_statistics,
             metrics,
             predicate,
+            case_sensitive,
             props: OnceCell::new(),
         }
     }
@@ -230,16 +235,17 @@ impl ExecutionPlan for ParquetExec {
         let fs_provider = Arc::new(FsProvider::new(jni_new_global_ref!(fs.as_obj())?, &io_time));
         let parquet_file_reader_factory = Arc::new(FsReaderFactory::new(fs_provider));
 
-        let schema_adapter_factory = Arc::new(AuronSchemaAdapterFactory);
-        let expr_adapter_factory = self
+        let schema_adapter_factory = Arc::new(AuronSchemaAdapterFactory(self.case_sensitive));
+        let has_field_ids = self
             .base_config
             .file_schema()
             .fields()
             .iter()
-            .any(|field| field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY))
-            .then(|| {
-                Arc::new(AuronPhysicalExprAdapterFactory) as Arc<dyn PhysicalExprAdapterFactory>
-            });
+            .any(|field| field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY));
+        let expr_adapter_factory = (self.case_sensitive.is_some() || has_field_ids).then(|| {
+            Arc::new(AuronPhysicalExprAdapterFactory(self.case_sensitive))
+                as Arc<dyn PhysicalExprAdapterFactory>
+        });
         let projection: Arc<[usize]> = match self.base_config.file_column_projection_indices() {
             Some(proj) => proj.into(),
             None => (0..self.base_config.file_schema().fields().len())

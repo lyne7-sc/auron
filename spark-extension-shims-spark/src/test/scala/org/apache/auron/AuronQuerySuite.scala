@@ -133,6 +133,38 @@ class AuronQuerySuite extends AuronQueryTest with BaseAuronSQLSuite with AuronSQ
     }
   }
 
+  test("Parquet field resolution follows case-insensitive Spark schemas") {
+    withSQLConf("spark.sql.caseSensitive" -> "false") {
+      withTempPath { path =>
+        withSQLConf("spark.auron.enabled" -> "false") {
+          sql("SELECT 1 AS ID, named_struct('QTY', 5, 'available', 10, 'extra', 0) AS item").write
+            .parquet(path.getCanonicalPath)
+        }
+        checkSparkAnswerAndOperator(() =>
+          spark.read
+            .schema("id INT, item STRUCT<qty: INT, available: INT>")
+            .parquet(path.getCanonicalPath)
+            .where("id = 1 AND item.qty > 0")
+            .selectExpr("item.qty", "item.available"))
+      }
+    }
+  }
+
+  test("Parquet field resolution keeps distinct case-sensitive columns") {
+    withSQLConf("spark.sql.caseSensitive" -> "true") {
+      withTempPath { path =>
+        withSQLConf("spark.auron.enabled" -> "false") {
+          sql("SELECT 10 AS id, 20 AS ID").write.parquet(path.getCanonicalPath)
+        }
+        checkSparkAnswerAndOperator(() =>
+          spark.read
+            .parquet(path.getCanonicalPath)
+            .where("id = 10 AND ID = 20")
+            .select("id", "ID"))
+      }
+    }
+  }
+
   test("test partition path has url encoded character") {
     withTable("t1") {
       sql(
